@@ -1,6 +1,6 @@
 # AFEP Architecture
 
-Engineering reference for v0.2.0. Every number here is read from source
+Engineering reference for v0.3.0. Every number here is read from source
 (LOC via `grep -c`, test counts from `grep "func Test"` / `def test_`,
 contracts counted in `proto/afep/v1/`).
 
@@ -33,7 +33,7 @@ contracts counted in `proto/afep/v1/`).
 
 `cmd/afepd` startup: load-or-create the ed25519 seed (0600) -> issue the
 self-signed card (clearances/capabilities from flags) -> open the durable
-task store -> build the gRPC service (score + store wired) -> optional
+task store and prune stale terminal tasks (`-prune-age`, hourly ticker) -> build the gRPC service (score + store wired) -> optional
 mesh (Dial, KV card publish, router peers, durable consumer bound to the
 mesh handler) -> serve gRPC on TCP and optionally QUIC -> serve the A2A
 well-known card over HTTP -> SIGINT/SIGTERM shuts everything down with a
@@ -68,18 +68,18 @@ event.
 
 ## Packages
 
-Hand-written Go: **4,642 LOC** across 16 packages, **86 test functions**;
-Python reference: **763 LOC**, **24 tests**; contracts: 4 proto files,
+Hand-written Go: **4,925 LOC** across 16 packages, **91 test functions**;
+Python reference: **814 LOC**, **25 tests**; contracts: 4 proto files,
 209 LOC, 20 messages/enums/service blocks, 4 RPCs.
 
 | Package | LOC | Tests | Role |
 |---|---|---|---|
-| `cmd/afepd` | 249 | - | flags, key custody, mesh/QUIC/HTTP wiring |
-| `internal/identity` | 436 | 15 | card/bid/envelope signing (deterministic body) |
-| `internal/transport/grpcsvc` | 614 | 10 | RPCs: signed bids, clearances, schema gate, store |
-| `internal/bus/nats` | 541 | 6 | stream/KV/bids, durable consume, Term-on-poison |
+| `cmd/afepd` | 279 | - | flags, key custody, mesh/QUIC/HTTP wiring, prune loop |
+| `internal/identity` | 462 | 16 | card/bid/envelope signing (deterministic body) |
+| `internal/transport/grpcsvc` | 689 | 11 | RPCs: signed bids, clearances, schema gate, store |
+| `internal/bus/nats` | 557 | 6 | stream/KV/bids, durable consume, Term-on-poison |
 | `internal/a2a` | 362 | 8 | A2A card derivation, state map, well-known handler |
-| `internal/mesh` | 394 | 8 | inbound envelope policy: serve / escalate / drop |
+| `internal/mesh` | 530 | 11 | inbound policy: verify issuer, serve / escalate / drop |
 | `internal/quictransport` | 390 | 3 | QUIC listener/dialer, stream->net.Conn, TLS bootstrap |
 | `internal/router` | 273 | 8 | escalation with hop budget and peer ordering |
 | `internal/interop` | 292 | 3 | fixture generation + cross-language verification |
@@ -103,8 +103,14 @@ by the interop fixtures (Go verification fails when the schema moves).
   deterministic serialization with the signature cleared.
 - **TaskEnvelope** — `task_id`/`root_task_id` audit chain, tenant,
   issuer/assignee, state, capability + `payload_type`/`payload` validated
-  at every ingress, bids, deadline, escalation, `hops`, issuer signature
-  (signed on emission; verified via `identity.VerifyEnvelope`).
+  at every ingress, bids, deadline, escalation, `hops`.
+  **Signature semantics (signed core)**: the issuer signs the request
+  essence (ids, tenant, issuer, capability, payload, deadline); the
+  relay-mutable tail (state, assignee, bids, updated_at, escalation,
+  hops) is excluded so routers stamp hops/escalations without the issuer
+  key. Both ingresses enforce it: the mesh resolves the issuer from the
+  KV directory (unknown/unverifiable -> Term), gRPC `TaskStream` from
+  self/registry (InvalidArgument / NotFound / PermissionDenied).
 - **Bus** — stream `AFEP_TASKS` (subjects `afep.*.*.envelopes`, file,
   24h, 2min dedup, key `task_id:state:hops`); KV `afep_cards` (7d TTL);
   bids ephemeral on core NATS with key `task:agent`.
@@ -119,7 +125,9 @@ by the interop fixtures (Go verification fails when the schema moves).
   fields); the bus Terms poison envelopes instead of looping redelivery.
 - **Trust chain** — cards verify on admission (`registry.Put`), bids
   verify against the answering card, emitted envelopes carry the issuer
-  signature; stale/forged artifacts are rejected in tests both languages.
+  signature, and **both ingress paths enforce it** (mesh via KV resolver,
+  transport via self/registry); stale/forged artifacts are rejected in
+  tests both languages.
 - **Delivery** — at-least-once for envelopes with hop-aware idempotent
   publish; explicit acks, MaxDeliver=5, Nak on handler error; bids are
   at-most-once by design (re-probe instead of replay).
@@ -145,17 +153,15 @@ by the interop fixtures (Go verification fails when the schema moves).
   vocabulary. The A2A task RPC surface (`SendMessage` and friends) and
   RFC 8785 JWS card signatures are not implemented; the AFEP ed25519 card
   remains the trust anchor.
-- **Envelope ingress does not enforce issuer signatures yet**: signing
-  and verification ship in both languages and servers sign on emission,
-  but transport/bus admission still accepts unsigned envelopes from
-  peers.
 - **Federation template is leafnode pair** (the outbound-only pattern);
   NATS superclusters (gateway blocks) are not templated. Configs are
   dev-grade: no TLS or leaf authentication — keep them in-network.
 - **Ranking score is a static flag** (`-bid-score`); no load- or
   latency-aware scoring yet.
-- **Task-store pruning is unwired**: `PruneTerminal` exists but afepd
-  never schedules it (call it from ops or a future ticker).
+- **Foreign direct-gRPC issuers must already be in the local registry**:
+  the mesh resolves issuers from the KV directory (complete), while
+  `TaskStream` resolves from self/registry only — a KV->registry sync
+  for foreign peers dialing gRPC directly is pending.
 - **Python stub regeneration is manual** after proto changes; the Go
   stubs are CI-drift-checked, and the interop fixtures fail loudly when
   wire shapes diverge. Pyright reports false positives on generated pb2

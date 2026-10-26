@@ -75,6 +75,7 @@ AFEP_NATS=nats://127.0.0.1:4224 go test ./internal/bus/nats -run Integration -v
 -capability    comma list of advertised capabilities
 -bid-score     score stamped on this node's bids
 -peers         comma list of peer domains for cross-domain escalation
+-prune-age     prune terminal tasks older than this (default 24h, 0 = off)
 ```
 
 ## Subject scheme
@@ -118,6 +119,6 @@ docs/ARCHITECTURE.md          technical reference (incl. honest residuals)
 
 ## Status
 
-v0.2.0 — experimental. All v0.1.0 gaps are closed; the current honest
+v0.3.0 — experimental. All v0.1.0 gaps are closed; the current honest
 residuals live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 License: MIT.

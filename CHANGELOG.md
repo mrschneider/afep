@@ -3,6 +3,30 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-10-26
+
+### Added
+
+- Issuer-signature enforcement at both envelope ingress paths: the mesh
+  handler resolves issuers through a required `CardResolver` (KV-backed in
+  afepd) and Terminates unknown/unverifiable envelopes; gRPC `TaskStream`
+  rejects them with InvalidArgument / NotFound / PermissionDenied.
+- Signed-core envelope semantics (Go + Python, byte-parity): the
+  signature covers the request essence (ids, tenant, issuer, capability,
+  payload, deadline); the relay-mutable lifecycle tail (state, assignee,
+  bids, updated_at, escalation, hops) is excluded so routers can stamp
+  hops and escalations without the issuer key.
+- Daemon task-store pruning: `-prune-age` (default 24h, 0 disables) with
+  a boot prune and an hourly ticker.
+- `staticcheck` gate in the go CI job (zero findings at introduction).
+- Negative-trust test coverage in both languages: unsigned, unknown
+  issuer, and foreign-signature rejection at mesh and transport ingress.
+
+### Changed
+
+- Interop fixtures re-signed under signed-core semantics (both sides
+  regenerated in the same change).
+
 ## [0.2.0] - 2026-10-26
 
 ### Added
