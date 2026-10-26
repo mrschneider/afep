@@ -1,112 +1,164 @@
 # AFEP Architecture
 
-Engineering reference for the v0.1.0 scaffold. Every number here is read
-from source: LOC via `grep -c`, tests from `go test`, contracts counted in
-`proto/afep/v1/`.
+Engineering reference for v0.2.0. Every number here is read from source
+(LOC via `grep -c`, test counts from `grep "func Test"` / `def test_`,
+contracts counted in `proto/afep/v1/`).
 
 ## Layer diagram
 
 ```
-+---------------------------------------------------------------+
-|  Semantic layer (A2A-style)                                    |
-|  AgentCard: identity, clearances, capabilities (self-signed)   |
-|  TaskEnvelope: PROBE -> BID -> COMMIT -> RUNNING -> DONE       |
-|                   FAILED / ESCALATED (cross-domain handoff)    |
-+----------------------------+----------------------------------+
++------------------------------------------------------------------+
+|  Semantic layer (A2A-aligned)                                     |
+|  AgentCard (ed25519 self-signed) + tenant clearances              |
+|  TaskEnvelope: PROBE -> BID -> COMMIT -> RUNNING -> DONE          |
+|                  FAILED / ESCALATED (cross-domain, hops<=5)       |
+|  A2A v1.0 well-known card + state mapping (internal/a2a)          |
++----------------------------+-------------------------------------+
                              | protobuf wire format
-+----------------------------v----------------------------------+
-|  Transport: gRPC over HTTP/2 — service AgentTransportService   |
-|  GetCard | Probe (server-stream) | Commit | TaskStream (bi-di) |
-+----------------------------+----------------------------------+
++----------------------------v-------------------------------------+
+|  Transport: gRPC over HTTP/2 — service AgentTransportService      |
+|  GetCard | Probe (server-stream, signed bids) | Commit | bi-di    |
+|  optional: gRPC over QUIC streams (-listen-quic, custom ALPN)     |
++----------------------------+-------------------------------------+
                              | envelopes as NATS messages
-+----------------------------v----------------------------------+
-|  Messaging: NATS JetStream                                     |
-|  stream AFEP_TASKS (afep.>) | KV afep_cards | durable consumers |
-+---------------------------------------------------------------+
++----------------------------v-------------------------------------+
+|  Messaging: NATS JetStream                                        |
+|  stream AFEP_TASKS (afep.*.*.envelopes) | KV afep_cards           |
+|  durable per-domain consumers | router relay afep.<d>.relay.*     |
+|  bids: ephemeral core NATS afep.<d>.*.bids (signed)               |
++------------------------------------------------------------------+
 ```
 
 ## Entrypoint and lifecycle
 
-`cmd/afepd` startup:
+`cmd/afepd` startup: load-or-create the ed25519 seed (0600) -> issue the
+self-signed card (clearances/capabilities from flags) -> open the durable
+task store -> build the gRPC service (score + store wired) -> optional
+mesh (Dial, KV card publish, router peers, durable consumer bound to the
+mesh handler) -> serve gRPC on TCP and optionally QUIC -> serve the A2A
+well-known card over HTTP -> SIGINT/SIGTERM shuts everything down with a
+3s hard-stop cap. Mesh absence logs `mesh disabled` and gRPC keeps serving.
 
-1. load-or-create the ed25519 seed (file mode 0600) and issue the
-   self-signed AgentCard;
-2. `registry.Put(self)` — only signature-verified cards are admitted;
-3. optional mesh: Dial JetStream, publish the card to KV, subscribe a
-   durable consumer on the site domain. A site without NATS logs
-   `mesh disabled` and keeps serving direct gRPC;
-4. serve `AgentTransportService`; SIGINT/SIGTERM triggers GracefulStop
-   with a 3s hard-stop cap.
+A task's life: `Probe` creates a PROBE envelope, streams at most one
+**ed25519-signed self-bid** (capability + clearance gated; zero bids still
+carry the task id so the caller can escalate); `Commit` re-checks the
+winner's clearance and emits an **issuer-signed** envelope; RUNNING/DONE/
+FAILED belong to executors; ESCALATED re-enters as PROBE in the target
+domain with `root_task_id` preserved.
 
-A task's life: `Probe` creates a PROBE envelope and streams bids (BID);
-`Commit` picks the assignee (COMMIT); RUNNING/DONE/FAILED belong to
-executors; ESCALATED re-enters as PROBE in the target domain with
-`root_task_id` preserved as the audit chain.
+## Gap closures (0.1.0 -> 0.2.0)
+
+| v0.1.0 gap | Resolution | Evidence |
+|---|---|---|
+| Unsigned/unranked bids | `identity.SignBid/VerifyBid`, `rank` (score desc, id asc), `pkg/client.ProbeAll` verifies every bid against its card | `pkg/client` tests: aggregation order, unreachable, **stale-card signature rejected** |
+| Clearances not enforced | `clearance.CanServe` gates Probe admission and Commit winner | `TestProbeClearanceDeniedYieldsNoBids` + mesh serve gate |
+| HTTP/3 not wired | `internal/quictransport`: gRPC over QUIC streams, self-signed TLS 1.3, ALPN `afep-quic/0.1`, `-listen-quic` | `TestGRPCOverQUIC` (two RPCs, multiplexed), live daemon smoke |
+| Payload type was a label | `schemareg`: registered media types, proto/JSON decode, **unknown-field rejection**; enforced at Probe/TaskStream, bus Terms poison | `schemareg` 8 tests + `TestTaskStreamRejects*` |
+| In-memory task table | `taskstore`: atomic tmp+rename JSON, restart roundtrip, `PruneTerminal` API, `-state` flag | `TestTaskStoreSurvivesRestart`, taskstore 4 tests |
+| No cross-domain router | `router` (hop guards `ErrHopLimit`/`ErrNoPeer`, relay subject) + `mesh` handler (serve / escalate / drop) | unit 8+8 tests; **live E2E**: beta provider escalates to alpha inbox (hops=1) — also verified across the federation leaf |
+| Go-only | `python/afep` (identity/lifecycle/subjects) + cross-language fixtures both directions | python 24 tests; `TestPythonFixturesVerify` (Go checks Python sigs); python checks Go sigs |
+| No federation template | `deploy/federation`: core hub + outbound-only edge leafnode, host ports 4223/4224 | containers Up, `Leafnode connection created` both sides, full integration suite **PASS via edge URL** |
+| Not A2A-wire-aware | `internal/a2a`: v1.0 Agent Card (required fields, supportedInterfaces, skills, ETag/304 caching) at both well-known URIs + 8-state mapping (spec-grounded) | a2a 8 tests incl. conditional GET |
+
+Wire-level bug found and fixed by the E2E: JetStream de-duplicates
+`Nats-Msg-Id` **stream-wide**, so an escalation sharing its probe's task id
+was silently swallowed (`PublishMsg` still acks duplicates). The dedup key
+is now `task_id:state:hops` — each lifecycle hop is its own idempotent
+event.
 
 ## Packages
 
-Hand-written Go: **1,316 LOC** across 12 files; **20 test functions**;
-all packages green under `go test ./...`.
+Hand-written Go: **4,642 LOC** across 16 packages, **86 test functions**;
+Python reference: **763 LOC**, **24 tests**; contracts: 4 proto files,
+209 LOC, 20 messages/enums/service blocks, 4 RPCs.
 
-| Package | LOC | Role |
-|---|---|---|
-| `cmd/afepd` | 138 | flags, key custody, mesh opt-in, shutdown |
-| `internal/identity` | 107 | ed25519 keys; card body signed deterministically with the signature field cleared |
-| `internal/lifecycle` | 76 | transition table + `Apply` (stamps `updated_at`) |
-| `internal/registry` | 66 | signature-checked card map with capability index |
-| `internal/bus/nats` | 289 | Dial, stream management, KV cards, dedup publish, durable consume |
-| `internal/transport/grpcsvc` | 176 | RPCs over registry + in-memory task table |
+| Package | LOC | Tests | Role |
+|---|---|---|---|
+| `cmd/afepd` | 249 | - | flags, key custody, mesh/QUIC/HTTP wiring |
+| `internal/identity` | 436 | 15 | card/bid/envelope signing (deterministic body) |
+| `internal/transport/grpcsvc` | 614 | 10 | RPCs: signed bids, clearances, schema gate, store |
+| `internal/bus/nats` | 541 | 6 | stream/KV/bids, durable consume, Term-on-poison |
+| `internal/a2a` | 362 | 8 | A2A card derivation, state map, well-known handler |
+| `internal/mesh` | 394 | 8 | inbound envelope policy: serve / escalate / drop |
+| `internal/quictransport` | 390 | 3 | QUIC listener/dialer, stream->net.Conn, TLS bootstrap |
+| `internal/router` | 273 | 8 | escalation with hop budget and peer ordering |
+| `internal/interop` | 292 | 3 | fixture generation + cross-language verification |
+| `internal/taskstore` | 247 | 4 | atomic persistence + terminal pruning |
+| `pkg/client` | 242 | 3 | ProbeAll: fan-out, verify, rank |
+| `internal/schemareg` | 189 | 8 | media-type registry and payload validation |
+| `internal/lifecycle` | 149 | 3 | transition table + Apply |
+| `internal/registry` | 130 | 3 | verified card directory + capability index |
+| `internal/clearance` | 88 | 2 | grant/wildcard matching, tenant admission |
+| `internal/rank` | 46 | 2 | deterministic bid ordering |
 
-Contracts: 3 proto files, 192 LOC, 19 messages/enums/service blocks, 4 RPCs.
-Generated stubs in `gen/` are committed; CI regenerates and fails on drift.
+Generated stubs in `gen/` are committed; CI regenerates and fails on
+drift. Python stubs (`python/afep/v1/`) are regenerated with
+`buf generate --template buf.gen.python.yaml`; wire-shape drift is caught
+by the interop fixtures (Go verification fails when the schema moves).
 
 ## Data model
 
-- **AgentCard** — `id`, raw ed25519 public key, endpoint (gRPC address,
-  NATS subject prefix, gateway routes), `capabilities[]` (name/version/
-  constraints), `security_clearances[]`, self-signature over the
-  deterministic serialization with the signature field cleared.
-- **TaskEnvelope** — `task_id` + `root_task_id` audit chain, tenant,
-  issuer/assignee, `state`, requested `capability`, typed `payload`
-  (`payload_type` media type), `bids[]`, `deadline`, `escalation`,
-  issuer signature.
-- **Bus** — subjects `afep.<domain>.<agent>.<verb>`; stream `AFEP_TASKS`
-  (file storage, 24h max age, 2min de-dup window, `Nats-Msg-Id` =
-  task id); KV bucket `afep_cards` with 7d TTL.
+- **AgentCard** — id, raw ed25519 key, endpoint (gRPC addr, NATS prefix,
+  gateways), capabilities, `security_clearances`, self-signature over the
+  deterministic serialization with the signature cleared.
+- **TaskEnvelope** — `task_id`/`root_task_id` audit chain, tenant,
+  issuer/assignee, state, capability + `payload_type`/`payload` validated
+  at every ingress, bids, deadline, escalation, `hops`, issuer signature
+  (signed on emission; verified via `identity.VerifyEnvelope`).
+- **Bus** — stream `AFEP_TASKS` (subjects `afep.*.*.envelopes`, file,
+  24h, 2min dedup, key `task_id:state:hops`); KV `afep_cards` (7d TTL);
+  bids ephemeral on core NATS with key `task:agent`.
+- **Task store** — JSON file (protojson), atomic replace, optional
+  `PruneTerminal(maxAge)`.
 
 ## Cross-cutting guarantees
 
-- **Schema boundary** — `buf lint` (STANDARD category) runs in CI on
-  every change; protobuf rejects ill-typed fields at the
-  serialization boundary, so an agent cannot smuggle unstructured data
-  into an envelope.
-- **Trust** — every card is signature-verified before admission
-  (`registry.Put`); tests re-verify served cards and reject tampered ones.
-- **Delivery** — at-least-once with idempotent publish (de-dup key =
-  task id), explicit acks, `MaxDeliver=5`, Nak redelivery for handler
-  errors, Term for poison messages.
-- **Offline tolerance** — the durable consumer buffers while a site is
-  disconnected and replays after recovery.
-- **Graceful degradation** — the mesh is optional per site; gRPC keeps
-  working without a broker.
+- **Schema boundary** — buf STANDARD lint in CI; protobuf rejects bad
+  fields at (de)serialization; `schemareg` additionally rejects
+  unregistered media types and any bytes outside the schema (unknown
+  fields); the bus Terms poison envelopes instead of looping redelivery.
+- **Trust chain** — cards verify on admission (`registry.Put`), bids
+  verify against the answering card, emitted envelopes carry the issuer
+  signature; stale/forged artifacts are rejected in tests both languages.
+- **Delivery** — at-least-once for envelopes with hop-aware idempotent
+  publish; explicit acks, MaxDeliver=5, Nak on handler error; bids are
+  at-most-once by design (re-probe instead of replay).
+- **Loop safety** — router never re-enters the arrival domain, drops at
+  `ErrNoPeer`/`ErrHopLimit` (default 5 hops), audits via
+  `root_task_id` + escalation chain.
+- **Offline tolerance** — durable consumers buffer per domain while a
+  site disconnects and replay on recovery (proven across the leaf link).
+- **Graceful degradation** — no broker => gRPC-only; no QUIC flag =>
+  TCP-only; HTTP card optional.
+- **Interop** — Go and Python produce byte-identical signed artifacts
+  (deterministic protobuf), verified in both directions from committed
+  fixtures.
 
-## Honest notes / gaps (v0.1.0)
+## Honest notes / residuals (v0.2.0)
 
-- **Bid signing and ranking are not implemented**: `Bid.signature` and
-  `score` exist on the wire, but the scaffold returns score 0 in
-  registry order and never signs provider bids.
-- **Security clearances ride in cards but nothing enforces them** — no
-  routing or admission check consults them yet.
-- **HTTP/3**: contracts are transport-agnostic, but the default stack is
-  HTTP/2; QUIC requires a gRPC setup not wired in this scaffold.
-- **Payload schema registry**: `payload_type` is a media-type label;
-  actual schema validation against a registry is pending.
-- **Task table is in-memory**: a restart loses non-committed tasks; the
-  durable path is the JetStream stream, not the gRPC table.
-- **No cross-domain router**: ESCALATED re-entry is legal in the state
-  machine, but no component performs the inter-domain handoff yet.
-- **Single language**: Go only — no Python/TS SDK or interop fixtures yet.
-- **Single-node broker**: compose ships one NATS node; supercluster or
-  leafnode federation is the intended pattern but not templated here.
-- **Not A2A-wire-compatible**: cards and lifecycle are aligned with the
-  A2A protocol conceptually; the protobuf contracts are AFEP's own.
+- **HTTP/3**: what ships is gRPC over QUIC streams with custom ALPN
+  `afep-quic/0.1` — grpc-go has no production HTTP/3 transport yet, so
+  this is not standardized h3. The client dials with
+  `InsecureSkipVerify` (dev scaffold): pin a CA or add mTLS before real
+  networks.
+- **A2A scope**: discovery-level only — Agent Card + task-state
+  vocabulary. The A2A task RPC surface (`SendMessage` and friends) and
+  RFC 8785 JWS card signatures are not implemented; the AFEP ed25519 card
+  remains the trust anchor.
+- **Envelope ingress does not enforce issuer signatures yet**: signing
+  and verification ship in both languages and servers sign on emission,
+  but transport/bus admission still accepts unsigned envelopes from
+  peers.
+- **Federation template is leafnode pair** (the outbound-only pattern);
+  NATS superclusters (gateway blocks) are not templated. Configs are
+  dev-grade: no TLS or leaf authentication — keep them in-network.
+- **Ranking score is a static flag** (`-bid-score`); no load- or
+  latency-aware scoring yet.
+- **Task-store pruning is unwired**: `PruneTerminal` exists but afepd
+  never schedules it (call it from ops or a future ticker).
+- **Python stub regeneration is manual** after proto changes; the Go
+  stubs are CI-drift-checked, and the interop fixtures fail loudly when
+  wire shapes diverge. Pyright reports false positives on generated pb2
+  modules (runtime and CI are green).
+- **Bids have no replay**: core-NATS ephemeral delivery means a
+  collector that starts late misses bids — by design, re-probe.
