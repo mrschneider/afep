@@ -24,6 +24,20 @@ type BidPublisher interface {
 	PublishBid(domain, agent string, bid *afepv1.Bid) error
 }
 
+// CardResolver resolves an issuer's AgentCard (KV directory in
+// production, static maps in tests). ok=false means unknown issuer.
+type CardResolver interface {
+	Card(ctx context.Context, agentID string) (*afepv1.AgentCard, bool, error)
+}
+
+// CardResolverFunc adapts a plain function (e.g. natsbus.Bus.GetCard).
+type CardResolverFunc func(ctx context.Context, agentID string) (*afepv1.AgentCard, bool, error)
+
+// Card implements CardResolver.
+func (f CardResolverFunc) Card(ctx context.Context, agentID string) (*afepv1.AgentCard, bool, error) {
+	return f(ctx, agentID)
+}
+
 // Config wires a mesh handler. Domain, Self, Key and Bids are mandatory;
 // Router is optional (no escalation without it).
 type Config struct {
@@ -35,6 +49,7 @@ type Config struct {
 	Router  *router.Router
 	Bids    BidPublisher
 	Relay   router.Publisher
+	Issuers CardResolver
 }
 
 // Handler processes one inbound envelope per call.
@@ -47,6 +62,7 @@ type Handler struct {
 	router  *router.Router
 	bids    BidPublisher
 	relay   router.Publisher
+	issuers CardResolver
 }
 
 const defaultScore = 100
@@ -58,6 +74,9 @@ func New(cfg Config) (*Handler, error) {
 	}
 	if cfg.Router != nil && cfg.Relay == nil {
 		return nil, errors.New("afep/mesh: router requires a relay publisher")
+	}
+	if cfg.Issuers == nil {
+		return nil, errors.New("afep/mesh: issuer resolver is required")
 	}
 	if cfg.Schemas == nil {
 		cfg.Schemas = schemareg.New()
@@ -74,6 +93,7 @@ func New(cfg Config) (*Handler, error) {
 		router:  cfg.Router,
 		bids:    cfg.Bids,
 		relay:   cfg.Relay,
+		issuers: cfg.Issuers,
 	}, nil
 }
 
@@ -92,6 +112,9 @@ func (h *Handler) OnEnvelope(ctx context.Context, env *afepv1.TaskEnvelope) erro
 	if err := h.schemas.ValidateEnvelope(env); err != nil {
 		return fmt.Errorf("%w: %v", ErrRejected, err)
 	}
+	if err := h.verifyIssuer(ctx, env); err != nil {
+		return err // ErrRejected (Term) or transient lookup error (Nak)
+	}
 	switch env.GetState() {
 	case afepv1.TaskState_TASK_STATE_PROBE, afepv1.TaskState_TASK_STATE_ESCALATED:
 	default:
@@ -107,6 +130,27 @@ func (h *Handler) OnEnvelope(ctx context.Context, env *afepv1.TaskEnvelope) erro
 			}
 			return err
 		}
+	}
+	return nil
+}
+
+// verifyIssuer enforces the trust chain at the federation boundary: the
+// issuer must resolve to a card whose key verifies the envelope's signed
+// core. Unknown or unverifiable envelopes are poison (ErrRejected).
+func (h *Handler) verifyIssuer(ctx context.Context, env *afepv1.TaskEnvelope) error {
+	issuer := env.GetIssuerAgent()
+	if issuer == "" {
+		return fmt.Errorf("%w: envelope has no issuer", ErrRejected)
+	}
+	card, ok, err := h.issuers.Card(ctx, issuer)
+	if err != nil {
+		return fmt.Errorf("afep/mesh: issuer lookup: %w", err) // transient: Nak
+	}
+	if !ok {
+		return fmt.Errorf("%w: unknown issuer %q", ErrRejected, issuer)
+	}
+	if err := identity.VerifyEnvelope(env, card); err != nil {
+		return fmt.Errorf("%w: issuer signature: %v", ErrRejected, err)
 	}
 	return nil
 }

@@ -43,6 +43,7 @@ func main() {
 	capability := flag.String("capability", "demo.echo", "comma-separated capabilities advertised by this node")
 	bidScore := flag.Uint64("bid-score", 100, "score stamped on this node's bids")
 	peers := flag.String("peers", "", "comma-separated peer domains for cross-domain escalation")
+	pruneAge := flag.Duration("prune-age", 24*time.Hour, "prune terminal tasks older than this (0 disables)")
 	flag.Parse()
 
 	kp, err := loadOrCreateKey(*keyPath)
@@ -74,6 +75,13 @@ func main() {
 	store, err := taskstore.Open(*statePath)
 	if err != nil {
 		log.Fatalf("taskstore: %v", err)
+	}
+	if *pruneAge > 0 {
+		if n, err := store.PruneTerminal(*pruneAge, time.Now()); err != nil {
+			log.Printf("taskstore prune: %v", err)
+		} else if n > 0 {
+			log.Printf("taskstore: pruned %d stale terminal tasks at boot", n)
+		}
 	}
 	svc, err := grpcsvc.New(self, reg, kp,
 		grpcsvc.WithBidScore(*bidScore),
@@ -107,6 +115,7 @@ func main() {
 			handler, err := mesh.New(mesh.Config{
 				Domain: *domain, Self: self, Key: kp, Score: *bidScore,
 				Router: rt, Bids: bus, Relay: bus,
+				Issuers: mesh.CardResolverFunc(bus.GetCard),
 			})
 			if err != nil {
 				log.Fatalf("mesh: %v", err)
@@ -182,7 +191,10 @@ func main() {
 		log.Printf("afepd: A2A card at http://%s%s", *httpListen, a2a.WellKnownPath)
 	}
 
-	log.Printf("afepd: ready (key=%s state=%s score=%d)", *keyPath, *statePath, *bidScore)
+	if *pruneAge > 0 {
+		go pruneLoop(ctx, store, *pruneAge)
+	}
+	log.Printf("afepd: ready (key=%s state=%s score=%d prune=%s)", *keyPath, *statePath, *bidScore, *pruneAge)
 
 	<-ctx.Done()
 	log.Print("afepd: shutting down")
@@ -201,6 +213,24 @@ func main() {
 		}
 	}
 	log.Print("afepd: stopped")
+}
+
+// pruneLoop prunes terminal tasks hourly until the context ends.
+func pruneLoop(ctx context.Context, store *taskstore.Store, age time.Duration) {
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if n, err := store.PruneTerminal(age, time.Now()); err != nil {
+				log.Printf("taskstore prune: %v", err)
+			} else if n > 0 {
+				log.Printf("taskstore: pruned %d terminal tasks", n)
+			}
+		}
+	}
 }
 
 func sanitize(id string) string {

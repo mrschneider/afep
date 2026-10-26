@@ -16,7 +16,7 @@
   "payload": "7b226e223a377d",
   "payload_type": "application/json",
   "root_task_id": "py-root-1",
-  "signature": "262f84534c4cd607b8193125251784039f7e1a43be44816bcf68755d89cbb49f4372b262bd5bcb407d2be30cd3ef86c68a428ece95472573f9f1a01a755beb0e",
+  "signature": "b4ae08aeee7e547ecc281e58f94103fc6172716db2f9125f92ac44ee8195f61f9f21750e15d72f16efec8125dfb0a460dbe17a9c1a4341c6d1131d7ce4936e0b",
   "state": 2,
   "task_id": "py-task-1",
   "tenant": "acme",

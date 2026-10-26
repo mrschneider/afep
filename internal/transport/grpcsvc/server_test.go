@@ -247,8 +247,15 @@ func TestTaskStreamEcho(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	inbound := &afepv1.TaskEnvelope{
+		TaskId: "echo-1", RootTaskId: "echo-1",
+		IssuerAgent: "local/server", Capability: "demo.echo",
+	}
+	if err := identity.SignEnvelope(inbound, self.kp); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.Send(&afepv1.TaskStreamRequest{Frame: &afepv1.TaskStreamRequest_Envelope{
-		Envelope: &afepv1.TaskEnvelope{Capability: "demo.echo"},
+		Envelope: inbound,
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -315,6 +322,47 @@ func TestTaskStoreSurvivesRestart(t *testing.T) {
 	}
 	if env.GetState() != afepv1.TaskState_TASK_STATE_COMMIT {
 		t.Fatalf("persisted state = %s", env.GetState())
+	}
+}
+
+func TestTaskStreamEnvelopeTrustRejections(t *testing.T) {
+	self := mustCard(t, "local/server", "demo.echo")
+	c := startService(t, self, nil)
+
+	codeOf := func(t *testing.T, env *afepv1.TaskEnvelope) codes.Code {
+		t.Helper()
+		st, err := c.TaskStream(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Send(&afepv1.TaskStreamRequest{Frame: &afepv1.TaskStreamRequest_Envelope{Envelope: env}}); err != nil {
+			t.Fatal(err)
+		}
+		_, err = st.Recv()
+		return status.Code(err)
+	}
+
+	// schema-valid but no issuer -> InvalidArgument
+	if got := codeOf(t, &afepv1.TaskEnvelope{TaskId: "t-noissuer", Capability: "demo.echo"}); got != codes.InvalidArgument {
+		t.Fatalf("unsigned: code = %s, want InvalidArgument", got)
+	}
+	// issuer not resolvable locally -> NotFound
+	foreign, _ := identity.Generate()
+	orphan := &afepv1.TaskEnvelope{TaskId: "t-ghost", RootTaskId: "t-ghost", IssuerAgent: "ghost/issuer", Capability: "demo.echo"}
+	if err := identity.SignEnvelope(orphan, foreign); err != nil {
+		t.Fatal(err)
+	}
+	if got := codeOf(t, orphan); got != codes.NotFound {
+		t.Fatalf("unknown issuer: code = %s, want NotFound", got)
+	}
+	// issuer = self but signed by a foreign key -> PermissionDenied
+	imposter, _ := identity.Generate()
+	bad := &afepv1.TaskEnvelope{TaskId: "t-imposter", RootTaskId: "t-imposter", IssuerAgent: "local/server", Capability: "demo.echo"}
+	if err := identity.SignEnvelope(bad, imposter); err != nil {
+		t.Fatal(err)
+	}
+	if got := codeOf(t, bad); got != codes.PermissionDenied {
+		t.Fatalf("bad signature: code = %s, want PermissionDenied", got)
 	}
 }
 

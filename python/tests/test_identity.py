@@ -75,13 +75,25 @@ class EnvelopeTests(unittest.TestCase):
         identity.sign_envelope(env, key)
         identity.verify_envelope(env, card)
 
-    def test_tamper_hops_fails(self):
+    def test_tamper_capability_fails(self):
         key, card = _card(b"\x44" * 32, "acme/issuer")
         env = self._env()
         identity.sign_envelope(env, key)
-        env.hops = 2
+        env.capability = "llm.infer"
         with self.assertRaises(identity.IdentityError):
             identity.verify_envelope(env, card)
+
+    def test_relay_tail_mutable(self):
+        key, card = _card(b"\x44" * 32, "acme/issuer")
+        env = self._env()
+        identity.sign_envelope(env, key)
+        env.state = task_pb2.TASK_STATE_ESCALATED
+        env.hops = 2
+        env.assignee_agent = "other/agent"
+        env.updated_at_unix = 1793999999
+        esc = env.escalation
+        esc.from_domain, esc.to_domain, esc.reason_code = "beta", "alpha", "NO_BIDS"
+        identity.verify_envelope(env, card)  # relay tail excluded from signature
 
     def test_unsigned_rejected(self):
         _, card = _card(b"\x44" * 32, "acme/issuer")

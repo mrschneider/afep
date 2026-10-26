@@ -42,9 +42,26 @@ func TestEnvelopeTamperFails(t *testing.T) {
 	if err := SignEnvelope(env, kp); err != nil {
 		t.Fatal(err)
 	}
-	env.Hops = 2 // relay mutation after signing
+	env.Capability = "llm.infer" // request essence is signed
 	if err := VerifyEnvelope(env, card); err == nil {
-		t.Fatal("tampered hops must fail")
+		t.Fatal("tampered capability must fail")
+	}
+}
+
+// The lifecycle tail is relay-mutable by design: routers stamp it without
+// the issuer key, so those mutations must NOT invalidate the signature.
+func TestEnvelopeRelayTailMutable(t *testing.T) {
+	kp, card, env := issuerAndEnv(t)
+	if err := SignEnvelope(env, kp); err != nil {
+		t.Fatal(err)
+	}
+	env.State = afepv1.TaskState_TASK_STATE_ESCALATED
+	env.Hops = 2
+	env.AssigneeAgent = "other/agent"
+	env.UpdatedAtUnix = 1793999999
+	env.Escalation = &afepv1.Escalation{FromDomain: "beta", ToDomain: "alpha", ReasonCode: "NO_BIDS"}
+	if err := VerifyEnvelope(env, card); err != nil {
+		t.Fatalf("relay tail must stay valid: %v", err)
 	}
 }
 

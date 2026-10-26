@@ -10,12 +10,21 @@ import (
 )
 
 // envelopeBody is the deterministic serialization covered by an envelope
-// signature: the envelope with the signature field cleared. Callers must
-// sign only after the final state transition (state, timestamps and hops
-// are all covered).
+// signature. The signed core is the request essence — ids, tenant, issuer,
+// capability, payload and deadline. The lifecycle tail (state, assignee,
+// bids, updated_at, escalation, hops) is relay-mutable: routers stamp it
+// without the issuer key, so it is protected by hop-qualified dedup keys
+// and the audit chain rather than by this signature. Callers sign after
+// building the request, not after each hop.
 func envelopeBody(env *afepv1.TaskEnvelope) ([]byte, error) {
 	e := proto.Clone(env).(*afepv1.TaskEnvelope)
 	e.Signature = nil
+	e.State = afepv1.TaskState_TASK_STATE_UNSPECIFIED
+	e.AssigneeAgent = ""
+	e.Bids = nil
+	e.UpdatedAtUnix = 0
+	e.Escalation = nil
+	e.Hops = 0
 	return proto.MarshalOptions{Deterministic: true}.Marshal(e)
 }
 

@@ -206,6 +206,9 @@ func (s *Server) TaskStream(stream afepv1.AgentTransportService_TaskStreamServer
 			if err := s.schemas.ValidateEnvelope(env); err != nil {
 				return status.Error(codes.InvalidArgument, err.Error())
 			}
+			if err := s.verifyIngressEnvelope(env); err != nil {
+				return err
+			}
 			if env.GetTaskId() == "" {
 				env.TaskId = newID()
 			}
@@ -236,6 +239,30 @@ func (s *Server) TaskStream(stream afepv1.AgentTransportService_TaskStreamServer
 			return status.Error(codes.InvalidArgument, "unknown frame type")
 		}
 	}
+}
+
+// verifyIngressEnvelope enforces issuer signatures on envelopes entering
+// via TaskStream: the issuer must be this node or a locally registered
+// card, and its key must verify the signed core.
+func (s *Server) verifyIngressEnvelope(env *afepv1.TaskEnvelope) error {
+	issuer := env.GetIssuerAgent()
+	if issuer == "" {
+		return status.Error(codes.InvalidArgument, "envelope has no issuer")
+	}
+	var card *afepv1.AgentCard
+	if issuer == s.self.GetId() {
+		card = s.self
+	} else {
+		c, ok := s.reg.Get(issuer)
+		if !ok {
+			return status.Errorf(codes.NotFound, "issuer %q not registered", issuer)
+		}
+		card = c
+	}
+	if err := identity.VerifyEnvelope(env, card); err != nil {
+		return status.Error(codes.PermissionDenied, "issuer signature: "+err.Error())
+	}
+	return nil
 }
 
 // save records the envelope in memory and, when configured, flushes it to

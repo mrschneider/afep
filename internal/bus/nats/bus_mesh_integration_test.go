@@ -47,6 +47,7 @@ func TestIntegrationMeshBidAndEscalation(t *testing.T) {
 	provMesh, err := mesh.New(mesh.Config{
 		Domain: "beta", Self: provCard, Key: kp, Score: 7,
 		Router: provRT, Bids: provBus, Relay: provBus,
+		Issuers: mesh.CardResolverFunc(provBus.GetCard),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -60,12 +61,21 @@ func TestIntegrationMeshBidAndEscalation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// requester node in domain alpha: bid inbox + escalation inbox
+	// requester node in domain alpha: identity published to the KV
+	// directory so the provider can verify its envelopes
 	reqBus, err := Dial(ctx, url)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reqBus.Close()
+	reqKP, _ := identity.Generate()
+	reqCard, err := identity.NewCard("alpha/requester", "requester", reqKP, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reqBus.PutCard(ctx, reqCard); err != nil {
+		t.Fatal(err)
+	}
 	bids := make(chan *afepv1.Bid, 4)
 	bidSub, err := reqBus.SubscribeBids("beta", func(_, _ string, bid *afepv1.Bid) {
 		t.Logf("requester bid inbox: task=%s from=%s score=%d", bid.GetTaskId(), bid.GetAgentId(), bid.GetScore())
@@ -96,6 +106,9 @@ func TestIntegrationMeshBidAndEscalation(t *testing.T) {
 		Tenant:      "acme",
 		IssuerAgent: "alpha/requester",
 	}
+	if err := identity.SignEnvelope(probe, reqKP); err != nil {
+		t.Fatal(err)
+	}
 	if err := reqBus.PublishEnvelope(ctx, "beta", "probe", probe); err != nil {
 		t.Fatal(err)
 	}
@@ -118,6 +131,9 @@ func TestIntegrationMeshBidAndEscalation(t *testing.T) {
 		State:       afepv1.TaskState_TASK_STATE_PROBE,
 		Capability:  "llm.absent",
 		IssuerAgent: "alpha/requester",
+	}
+	if err := identity.SignEnvelope(probe2, reqKP); err != nil {
+		t.Fatal(err)
 	}
 	if err := reqBus.PublishEnvelope(ctx, "beta", "probe", probe2); err != nil {
 		t.Fatal(err)

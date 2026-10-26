@@ -95,10 +95,49 @@ def verify_bid(bid: task_pb2.Bid, card: agent_card_pb2.AgentCard) -> None:
         raise IdentityError("bad bid signature") from exc
 
 
+def _envelope_body(env: task_pb2.TaskEnvelope) -> bytes:
+    """Signed core: request essence (ids, tenant, issuer, capability,
+    payload, deadline). The lifecycle tail (state, assignee, bids,
+    updated_at, escalation, hops) is relay-mutable and excluded —
+    byte-parity mirror of internal/identity (Go)."""
+    saved_sig = bytes(env.signature)
+    saved_state = env.state
+    saved_assignee = env.assignee_agent
+    saved_updated = env.updated_at_unix
+    saved_hops = env.hops
+    saved_bids = []
+    for b in env.bids:
+        m = task_pb2.Bid()
+        m.CopyFrom(b)
+        saved_bids.append(m)
+    saved_esc = task_pb2.Escalation()
+    has_esc = env.HasField("escalation")
+    if has_esc:
+        saved_esc.CopyFrom(env.escalation)
+    try:
+        env.signature = b""
+        env.state = task_pb2.TASK_STATE_UNSPECIFIED
+        env.assignee_agent = ""
+        env.updated_at_unix = 0
+        env.hops = 0
+        del env.bids[:]
+        env.ClearField("escalation")
+        return env.SerializeToString(deterministic=True)
+    finally:
+        env.signature = saved_sig
+        env.state = saved_state
+        env.assignee_agent = saved_assignee
+        env.updated_at_unix = saved_updated
+        env.hops = saved_hops
+        env.bids.extend(saved_bids)
+        if has_esc:
+            env.escalation.CopyFrom(saved_esc)
+
+
 def sign_envelope(env: task_pb2.TaskEnvelope, key: Ed25519PrivateKey) -> None:
     if not env.task_id:
         raise IdentityError("envelope has no task id")
-    env.signature = key.sign(_with_cleared_signature(env, "signature"))
+    env.signature = key.sign(_envelope_body(env))
 
 
 def verify_envelope(env: task_pb2.TaskEnvelope, issuer: agent_card_pb2.AgentCard) -> None:
@@ -109,6 +148,6 @@ def verify_envelope(env: task_pb2.TaskEnvelope, issuer: agent_card_pb2.AgentCard
     verify_card(issuer)
     pub = Ed25519PublicKey.from_public_bytes(bytes(issuer.public_key))
     try:
-        pub.verify(env.signature, _with_cleared_signature(env, "signature"))
+        pub.verify(env.signature, _envelope_body(env))
     except InvalidSignature as exc:
         raise IdentityError("bad envelope signature") from exc
