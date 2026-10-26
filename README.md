@@ -1,5 +1,10 @@
 # AFEP — Agentic Federation Protocol
 
+[![ci](https://github.com/mrschneider/afep/actions/workflows/ci.yml/badge.svg)](https://github.com/mrschneider/afep/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](python/)
+
 AFEP federates AI agents across administrative domains: typed RPC when
 peers can reach each other, a brokered message mesh when they cannot, and a
 shared task vocabulary so distinct agent frameworks interoperate.

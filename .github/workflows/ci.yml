@@ -33,18 +33,29 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: gofmt -l -d . | (! grep .)
+      - name: gofmt
+        run: test -z "$(gofmt -l cmd internal pkg)"
       - run: go vet ./...
       - run: go build ./...
+      - name: daemon smoke (flag parsing / import-time errors)
+        run: |
+          go build -o bin/afepd ./cmd/afepd
+          ./bin/afepd -h
       - run: go test ./...
 
   python:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
+      - name: Interop fixtures parse (stdlib sanity)
+        run: python -c "import json, glob; [json.load(open(p)) for p in glob.glob('python/testdata/*.json')]; print('fixtures ok')"
       - name: Install package
         run: pip install -e ./python
       - name: Unit + cross-language interop tests
