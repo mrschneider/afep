@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package afep.v1;
+
+option go_package = "github.com/mrschneider/afep/gen/go/afep/v1;afepv1";
+
+// Endpoint tells peers how to reach the agent: direct gRPC first,
+// brokered NATS as the fallback for NATed/firewalled deployments.
+message Endpoint {
+  // Direct gRPC dial target (host:port).
+  string grpc_address = 1;
+  // NATS subject prefix this agent serves, e.g. "afep.edge.mx.node7".
+  string nats_subject_prefix = 2;
+  // NATS gateway/leafnode routes that federate sites into one namespace.
+  repeated string nats_gateways = 3;
+}
+
+// Capability is a machine-readable skill declaration.
+message Capability {
+  // Dotted capability name, e.g. "vision.tag" or "llm.infer".
+  string name = 1;
+  string version = 2;
+  map<string, string> constraints = 3;
+}
+
+// AgentCard is the A2A-style manifest: identity, clearances, capabilities.
+// It is self-signed, so a card fetched from any peer carries its own trust.
+message AgentCard {
+  // Stable identifier, "tenant/agent-name".
+  string id = 1;
+  string display_name = 2;
+  // Raw ed25519 public key (32 bytes).
+  bytes public_key = 3;
+  Endpoint endpoint = 4;
+  repeated Capability capabilities = 5;
+  // Grants held inside the issuing admin domain, e.g. "tenant:acme".
+  repeated string security_clearances = 6;
+  map<string, string> metadata = 7;
+  int64 issued_at_unix = 8;
+  int64 expires_at_unix = 9;
+  // ed25519 signature over the deterministic serialization of this card
+  // with the signature field cleared.
+  bytes signature = 10;
+}

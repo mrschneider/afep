@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package afep.v1;
+
+option go_package = "github.com/mrschneider/afep/gen/go/afep/v1;afepv1";
+
+import "afep/v1/agent_card.proto";
+import "afep/v1/task.proto";
+
+message GetCardRequest {
+  string agent_id = 1;
+}
+
+message GetCardResponse {
+  AgentCard card = 1;
+}
+
+message ProbeRequest {
+  string tenant = 1;
+  string capability = 2;
+  string payload_type = 3;
+  int64 deadline_unix = 4;
+}
+
+message ProbeResponse {
+  // Task id shared by every message of this probe stream.
+  string task_id = 1;
+  repeated Bid bids = 2;
+}
+
+message CommitRequest {
+  string task_id = 1;
+  string winner_agent = 2;
+}
+
+message CommitResponse {
+  TaskEnvelope envelope = 1;
+}
+
+// Telemetry is execution metrics pushed while state == RUNNING.
+message Telemetry {
+  string task_id = 1;
+  int64 at_unix = 2;
+  map<string, string> metrics = 3;
+}
+
+// Chunk carries partial tool output or token streams.
+message Chunk {
+  string task_id = 1;
+  bytes data = 2;
+  bool last = 3;
+}
+
+message TaskStreamRequest {
+  oneof frame {
+    TaskEnvelope envelope = 1;
+    Chunk chunk = 2;
+  }
+}
+
+message TaskStreamResponse {
+  oneof frame {
+    TaskEnvelope envelope = 1;
+    Telemetry telemetry = 2;
+    Chunk chunk = 3;
+  }
+}
+
+// AgentTransport is the direct layer: strict typed contracts, bi-di
+// streaming, and many task threads multiplexed over one HTTP/2 connection.
+service AgentTransportService {
+  rpc GetCard(GetCardRequest) returns (GetCardResponse);
+  rpc Probe(ProbeRequest) returns (stream ProbeResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc TaskStream(stream TaskStreamRequest) returns (stream TaskStreamResponse);
+}

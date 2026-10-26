@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package afep.v1;
+
+option go_package = "github.com/mrschneider/afep/gen/go/afep/v1;afepv1";
+
+// TaskState is the cross-domain task lifecycle.
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  // Capability discovery: who can serve this request?
+  TASK_STATE_PROBE = 1;
+  // Providers are bidding on the probe.
+  TASK_STATE_BID = 2;
+  // A bid won; the assignee committed to the work.
+  TASK_STATE_COMMIT = 3;
+  // Work in progress, telemetry streaming.
+  TASK_STATE_RUNNING = 4;
+  TASK_STATE_DONE = 5;
+  TASK_STATE_FAILED = 6;
+  // Exception handed off to another administrative domain.
+  TASK_STATE_ESCALATED = 7;
+}
+
+// Bid is a provider's offer to serve a probe.
+message Bid {
+  string agent_id = 1;
+  // Provider-declared ranking, higher is better.
+  uint64 score = 2;
+  string rationale = 3;
+  int64 proposed_deadline_unix = 4;
+  bytes signature = 5;
+}
+
+// Deadline bounds the task lifetime.
+message Deadline {
+  int64 start_unix = 1;
+  int64 expires_unix = 2;
+}
+
+// Escalation carries an exception across admin domains.
+message Escalation {
+  string from_domain = 1;
+  string to_domain = 2;
+  // Machine-readable cause: "NO_BIDS", "DEADLINE", "CLEARANCE_DENIED".
+  string reason_code = 3;
+  string detail = 4;
+}
+
+// TaskEnvelope is the unit of work exchanged between agents.
+message TaskEnvelope {
+  string task_id = 1;
+  // Preserved across escalations: the audit chain root.
+  string root_task_id = 2;
+  string tenant = 3;
+  string issuer_agent = 4;
+  string assignee_agent = 5;
+  TaskState state = 6;
+  // Requested Capability.name.
+  string capability = 7;
+  // Media type of payload, schema validation happens at this boundary.
+  string payload_type = 8;
+  bytes payload = 9;
+  // Populated while state == TASK_STATE_BID.
+  repeated Bid bids = 10;
+  Deadline deadline = 11;
+  // Set when state == TASK_STATE_ESCALATED or TASK_STATE_FAILED.
+  Escalation escalation = 12;
+  int64 updated_at_unix = 13;
+  // Issuer ed25519 signature over the deterministic serialization with
+  // the signature field cleared.
+  bytes signature = 14;
+}
