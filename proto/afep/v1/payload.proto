@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package afep.v1;
+
+option go_package = "github.com/mrschneider/afep/gen/go/afep/v1;afepv1";
+
+// EchoPayload is the built-in schema used by demos and tests; it proves
+// payload_type-registered validation at every envelope ingress.
+message EchoPayload {
+  string text = 1;
+  uint64 seq = 2;
+}

@@ -12,6 +12,9 @@ lint:
 test:
 	go test ./...
 
+python-test:
+	cd python && python3 -m unittest discover -s tests -v
+
 build:
 	go build -o bin/afepd ./cmd/afepd
 

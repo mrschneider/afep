@@ -1,0 +1,32 @@
+# Two-site AFEP federation template (core hub + outbound-only edge).
+# Usage: docker compose -f deploy/federation/compose.yml up -d
+services:
+  afep-core:
+    image: nats:2.10-alpine
+    command: ["-c", "/etc/nats/nats.conf", "-js"]
+    volumes:
+      - ./core.conf:/etc/nats/nats.conf:ro
+      - core-data:/data
+    ports:
+      - "4223:4222"
+      - "8223:8222"
+    restart: unless-stopped
+
+  afep-edge:
+    image: nats:2.10-alpine
+    command: ["-c", "/etc/nats/nats.conf", "-js"]
+    volumes:
+      - ./edge.conf:/etc/nats/nats.conf:ro
+      - edge-data:/data
+    ports:
+      - "4224:4222"
+      - "8224:8222"
+    depends_on:
+      - afep-core
+    restart: unless-stopped
+
+networks: {}
+
+volumes:
+  core-data:
+  edge-data:

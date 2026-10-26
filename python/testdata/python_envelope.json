@@ -1,0 +1,24 @@
+{
+  "assignee_agent": "py/worker",
+  "capability": "vision.tag",
+  "deadline": {
+    "expires_unix": 1793003650,
+    "start_unix": 1793000050
+  },
+  "escalation": {
+    "detail": "hops=2",
+    "from_domain": "beta",
+    "reason_code": "NO_BIDS",
+    "to_domain": "alpha"
+  },
+  "hops": 2,
+  "issuer_agent": "py/interop",
+  "payload": "7b226e223a377d",
+  "payload_type": "application/json",
+  "root_task_id": "py-root-1",
+  "signature": "262f84534c4cd607b8193125251784039f7e1a43be44816bcf68755d89cbb49f4372b262bd5bcb407d2be30cd3ef86c68a428ece95472573f9f1a01a755beb0e",
+  "state": 2,
+  "task_id": "py-task-1",
+  "tenant": "acme",
+  "updated_at_unix": 1793000100
+}

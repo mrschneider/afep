@@ -1,4 +1,4 @@
-// Package grpcsvc exposes the AFEP AgentTransport service.
+// Package grpcsvc exposes the AFEP AgentTransportService.
 package grpcsvc
 
 import (
@@ -11,28 +11,72 @@ import (
 	"time"
 
 	afepv1 "github.com/mrschneider/afep/gen/go/afep/v1"
+	"github.com/mrschneider/afep/internal/clearance"
+	"github.com/mrschneider/afep/internal/identity"
 	"github.com/mrschneider/afep/internal/lifecycle"
 	"github.com/mrschneider/afep/internal/registry"
+	"github.com/mrschneider/afep/internal/schemareg"
+	"github.com/mrschneider/afep/internal/taskstore"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
-// Server is the reference implementation: card lookup, probe/commit over a
-// shared task table, and an echoing bi-directional stream.
+// defaultBidScore is used when no WithBidScore option is given.
+const defaultBidScore = 100
+
+// Server implements AgentTransportService: signed self-bids, clearance
+// admission, schema-validated envelopes and an optional durable task store.
 type Server struct {
 	afepv1.UnimplementedAgentTransportServiceServer
 
-	self *afepv1.AgentCard
-	reg  *registry.Registry
+	self    *afepv1.AgentCard
+	reg     *registry.Registry
+	kp      *identity.KeyPair
+	schemas *schemareg.Registry
+	store   *taskstore.Store
+	score   uint64
 
 	mu    sync.RWMutex
 	tasks map[string]*afepv1.TaskEnvelope
 }
 
-// New wires the service to a card and a registry.
-func New(self *afepv1.AgentCard, reg *registry.Registry) *Server {
-	return &Server{self: self, reg: reg, tasks: make(map[string]*afepv1.TaskEnvelope)}
+// Option customizes the service.
+type Option func(*Server)
+
+// WithBidScore sets the score stamped on self-bids (ranking input).
+func WithBidScore(n uint64) Option {
+	return func(s *Server) { s.score = n }
+}
+
+// WithSchemaRegistry replaces the payload validation registry.
+func WithSchemaRegistry(r *schemareg.Registry) Option {
+	return func(s *Server) { s.schemas = r }
+}
+
+// WithTaskStore persists state transitions across restarts.
+func WithTaskStore(st *taskstore.Store) Option {
+	return func(s *Server) { s.store = st }
+}
+
+// New wires the service: the node's card, directory and signing key are
+// mandatory — a node can only bid for identities whose key it holds.
+func New(self *afepv1.AgentCard, reg *registry.Registry, kp *identity.KeyPair, opts ...Option) (*Server, error) {
+	if self == nil || reg == nil || kp == nil {
+		return nil, fmt.Errorf("afep/grpcsvc: self card, registry and key pair are required")
+	}
+	s := &Server{
+		self:    self,
+		reg:     reg,
+		kp:      kp,
+		schemas: schemareg.New(),
+		score:   defaultBidScore,
+		tasks:   make(map[string]*afepv1.TaskEnvelope),
+	}
+	for _, o := range opts {
+		o(s)
+	}
+	return s, nil
 }
 
 // GetCard serves the self card or any registered agent card.
@@ -50,10 +94,13 @@ func (s *Server) GetCard(ctx context.Context, req *afepv1.GetCardRequest) (*afep
 	return &afepv1.GetCardResponse{Card: card}, nil
 }
 
-// Probe streams bids from every registered provider of the capability.
-// The first message always carries the task id, even with zero bids, so the
-// caller can escalate an unanswered probe.
+// Probe answers with at most one bid: this node's own, ed25519-signed, and
+// only when it advertises the capability and holds the tenant clearance.
+// A zero-bid response still carries the task id so the caller can escalate.
 func (s *Server) Probe(req *afepv1.ProbeRequest, stream afepv1.AgentTransportService_ProbeServer) error {
+	if err := s.schemas.Validate(req.GetPayloadType(), nil); err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
 	env := &afepv1.TaskEnvelope{
 		TaskId:        newID(),
 		Tenant:        req.GetTenant(),
@@ -65,31 +112,42 @@ func (s *Server) Probe(req *afepv1.ProbeRequest, stream afepv1.AgentTransportSer
 		UpdatedAtUnix: time.Now().Unix(),
 	}
 	env.RootTaskId = env.GetTaskId()
-	s.save(env)
-
-	sent := false
-	for _, p := range s.reg.ByCapability(req.GetCapability()) {
-		bid := &afepv1.Bid{
-			AgentId:              p.GetId(),
-			Rationale:            "scaffold: capability registered",
-			ProposedDeadlineUnix: req.GetDeadlineUnix(),
-		}
-		if err := stream.Send(&afepv1.ProbeResponse{TaskId: env.GetTaskId(), Bids: []*afepv1.Bid{bid}}); err != nil {
-			return err
-		}
-		sent = true
+	if err := s.save(env); err != nil {
+		return status.Error(codes.Internal, err.Error())
 	}
-	if sent {
-		if err := lifecycle.Apply(env, afepv1.TaskState_TASK_STATE_BID); err != nil {
-			return status.Error(codes.Internal, err.Error())
-		}
-	} else if err := stream.Send(&afepv1.ProbeResponse{TaskId: env.GetTaskId()}); err != nil {
+
+	empty := func() error {
+		return stream.Send(&afepv1.ProbeResponse{TaskId: env.GetTaskId()})
+	}
+
+	if err := clearance.CanServe(s.self, req.GetTenant()); err != nil {
+		return empty() // admission denied: no bid, caller escalates
+	}
+	if !hasCapability(s.self, req.GetCapability()) {
+		return empty() // capability not held: no bid, caller escalates
+	}
+
+	bid := &afepv1.Bid{
+		AgentId:              s.self.GetId(),
+		TaskId:               env.GetTaskId(),
+		Score:                s.score,
+		Rationale:            "self: capability registered and clearance held",
+		ProposedDeadlineUnix: req.GetDeadlineUnix(),
+	}
+	if err := identity.SignBid(bid, s.kp); err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+	if err := stream.Send(&afepv1.ProbeResponse{TaskId: env.GetTaskId(), Bids: []*afepv1.Bid{bid}}); err != nil {
 		return err
 	}
-	return nil
+	if err := lifecycle.Apply(env, afepv1.TaskState_TASK_STATE_BID); err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+	return s.save(env)
 }
 
-// Commit picks the winning bid of a probe and commits the assignee.
+// Commit picks the winning bid of a probe. The winner must be known (self
+// or registry) and must hold the envelope's tenant clearance.
 func (s *Server) Commit(ctx context.Context, req *afepv1.CommitRequest) (*afepv1.CommitResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -101,19 +159,38 @@ func (s *Server) Commit(ctx context.Context, req *afepv1.CommitRequest) (*afepv1
 	if req.GetWinnerAgent() == "" {
 		return nil, status.Error(codes.InvalidArgument, "winner_agent is required")
 	}
-	if _, ok := s.reg.Get(req.GetWinnerAgent()); !ok {
-		return nil, status.Errorf(codes.NotFound, "winner %q not registered", req.GetWinnerAgent())
+
+	var winner *afepv1.AgentCard
+	switch {
+	case req.GetWinnerAgent() == s.self.GetId():
+		winner = s.self
+	default:
+		c, ok := s.reg.Get(req.GetWinnerAgent())
+		if !ok {
+			return nil, status.Errorf(codes.NotFound, "winner %q not registered", req.GetWinnerAgent())
+		}
+		winner = c
 	}
+	if err := clearance.CanServe(winner, env.GetTenant()); err != nil {
+		return nil, status.Error(codes.PermissionDenied, err.Error())
+	}
+
 	env.AssigneeAgent = req.GetWinnerAgent()
 	if err := lifecycle.Apply(env, afepv1.TaskState_TASK_STATE_COMMIT); err != nil {
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
-	s.save(env)
-	return &afepv1.CommitResponse{Envelope: proto.Clone(env).(*afepv1.TaskEnvelope)}, nil
+	if err := s.save(env); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	out := proto.Clone(env).(*afepv1.TaskEnvelope)
+	if err := identity.SignEnvelope(out, s.kp); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return &afepv1.CommitResponse{Envelope: out}, nil
 }
 
-// TaskStream is the full-duplex loop: envelopes flow one way, chunks and
-// telemetry the other, multiplexed on one connection.
+// TaskStream is the full-duplex loop: every envelope frame crosses the
+// schema boundary before it is admitted; chunks relay as-is.
 func (s *Server) TaskStream(stream afepv1.AgentTransportService_TaskStreamServer) error {
 	for {
 		in, err := stream.Recv()
@@ -126,6 +203,9 @@ func (s *Server) TaskStream(stream afepv1.AgentTransportService_TaskStreamServer
 		switch frame := in.GetFrame().(type) {
 		case *afepv1.TaskStreamRequest_Envelope:
 			env := frame.Envelope
+			if err := s.schemas.ValidateEnvelope(env); err != nil {
+				return status.Error(codes.InvalidArgument, err.Error())
+			}
 			if env.GetTaskId() == "" {
 				env.TaskId = newID()
 			}
@@ -138,13 +218,17 @@ func (s *Server) TaskStream(stream afepv1.AgentTransportService_TaskStreamServer
 				}
 			}
 			env.UpdatedAtUnix = time.Now().Unix()
-			s.save(env)
+			if err := s.save(env); err != nil {
+				return status.Error(codes.Internal, err.Error())
+			}
 			out := proto.Clone(env).(*afepv1.TaskEnvelope)
+			if err := identity.SignEnvelope(out, s.kp); err != nil {
+				return status.Error(codes.Internal, err.Error())
+			}
 			if err := stream.Send(&afepv1.TaskStreamResponse{Frame: &afepv1.TaskStreamResponse_Envelope{Envelope: out}}); err != nil {
 				return err
 			}
 		case *afepv1.TaskStreamRequest_Chunk:
-			// Scaffold relay: echo partial output back on the same stream.
 			if err := stream.Send(&afepv1.TaskStreamResponse{Frame: &afepv1.TaskStreamResponse_Chunk{Chunk: frame.Chunk}}); err != nil {
 				return err
 			}
@@ -154,10 +238,16 @@ func (s *Server) TaskStream(stream afepv1.AgentTransportService_TaskStreamServer
 	}
 }
 
-func (s *Server) save(env *afepv1.TaskEnvelope) {
+// save records the envelope in memory and, when configured, flushes it to
+// the durable task store.
+func (s *Server) save(env *afepv1.TaskEnvelope) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.tasks[env.GetTaskId()] = env
+	s.mu.Unlock()
+	if s.store != nil {
+		return s.store.Put(env)
+	}
+	return nil
 }
 
 func (s *Server) load(id string) (*afepv1.TaskEnvelope, bool) {
@@ -165,6 +255,15 @@ func (s *Server) load(id string) (*afepv1.TaskEnvelope, bool) {
 	defer s.mu.RUnlock()
 	env, ok := s.tasks[id]
 	return env, ok
+}
+
+func hasCapability(card *afepv1.AgentCard, name string) bool {
+	for _, c := range card.GetCapabilities() {
+		if c.GetName() == name {
+			return true
+		}
+	}
+	return false
 }
 
 func newID() string {

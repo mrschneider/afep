@@ -1,0 +1,26 @@
+{
+  "capabilities": [
+    {
+      "name": "vision.tag",
+      "version": "9.9"
+    }
+  ],
+  "display_name": "Py Interop",
+  "endpoint": {
+    "grpc_address": "py.example.com:7700",
+    "nats_gateways": [],
+    "nats_subject_prefix": "afep.py.interop"
+  },
+  "expires_at_unix": 1793600000,
+  "id": "py/interop",
+  "issued_at_unix": 1793000000,
+  "metadata": {
+    "description": "python interop agent",
+    "version": "3.1.4"
+  },
+  "public_key": "bc653a64f10791773081592a1ab21fa113ef735cf7bb9ee2d43c933720fcb385",
+  "security_clearances": [
+    "tenant:acme"
+  ],
+  "signature": "819b9c6aea385c75d1f80d82139ac2d848baecb3e5dd4954de7042a7f4e57d705c7d1a28e652518dea6b05641d8dcb35cb098c20b1c4026ddbd0402f771e2a04"
+}

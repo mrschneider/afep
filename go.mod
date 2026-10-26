@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/nats-io/nats.go v1.55.0
+	github.com/quic-go/quic-go v0.64.0
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12
 )

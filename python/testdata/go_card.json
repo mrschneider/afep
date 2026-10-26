@@ -1,0 +1,26 @@
+{
+  "id": "go/interop",
+  "display_name": "Go Interop",
+  "public_key": "d558a597000ed61f56b9e7a988d3dccb605dcba0b340da875591af9da6783cb3",
+  "endpoint": {
+    "grpc_address": "go.example.com:7700",
+    "nats_subject_prefix": "afep.go.interop",
+    "nats_gateways": []
+  },
+  "capabilities": [
+    {
+      "name": "vision.tag",
+      "version": "9.9"
+    }
+  ],
+  "security_clearances": [
+    "tenant:acme"
+  ],
+  "metadata": {
+    "description": "go interop agent",
+    "version": "3.1.4"
+  },
+  "issued_at_unix": 1793000000,
+  "expires_at_unix": 1793600000,
+  "signature": "ec1ea61993e503e582817e464ad9d68eb756ec7574ee4b483dbd58b70708b5f0c33ff84dc96409e9ca5a55401b970929aec0615ad5fdf46f3986a211ca89a30e"
+}

@@ -1,5 +1,6 @@
-// afepd is the AFEP reference daemon: direct gRPC transport plus an
-// optional NATS JetStream mesh for NATed or federated sites.
+// afepd is the AFEP reference daemon: gRPC (TCP or QUIC), optional NATS
+// JetStream mesh with bid serving and cross-domain escalation, A2A
+// well-known discovery, durable task state.
 package main
 
 import (
@@ -8,6 +9,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,24 +18,39 @@ import (
 	"time"
 
 	afepv1 "github.com/mrschneider/afep/gen/go/afep/v1"
+	"github.com/mrschneider/afep/internal/a2a"
 	natsbus "github.com/mrschneider/afep/internal/bus/nats"
 	"github.com/mrschneider/afep/internal/identity"
+	"github.com/mrschneider/afep/internal/mesh"
+	"github.com/mrschneider/afep/internal/quictransport"
 	"github.com/mrschneider/afep/internal/registry"
+	"github.com/mrschneider/afep/internal/router"
+	"github.com/mrschneider/afep/internal/taskstore"
 	"github.com/mrschneider/afep/internal/transport/grpcsvc"
 	"google.golang.org/grpc"
 )
 
 func main() {
-	listen := flag.String("listen", "127.0.0.1:7700", "gRPC listen address")
+	listen := flag.String("listen", "127.0.0.1:7700", "gRPC TCP listen address")
+	listenQUIC := flag.String("listen-quic", "", "gRPC-over-QUIC listen address (empty disables)")
+	httpListen := flag.String("http-listen", "127.0.0.1:7701", "HTTP listener for the A2A well-known card (empty disables)")
 	natsURL := flag.String("nats", "nats://127.0.0.1:4222", "NATS URL; empty disables the mesh")
 	agentID := flag.String("id", "local/afepd", "agent id for the self card")
 	domain := flag.String("domain", "local", "NATS domain segment of the subject prefix")
 	keyPath := flag.String("key", defaultKeyPath(), "ed25519 seed file (0600, created if missing)")
+	statePath := flag.String("state", "", "durable task store file (default: next to the key)")
+	clearances := flag.String("clearances", "tenant:*", "comma-separated security clearances for the self card")
+	capability := flag.String("capability", "demo.echo", "comma-separated capabilities advertised by this node")
+	bidScore := flag.Uint64("bid-score", 100, "score stamped on this node's bids")
+	peers := flag.String("peers", "", "comma-separated peer domains for cross-domain escalation")
 	flag.Parse()
 
 	kp, err := loadOrCreateKey(*keyPath)
 	if err != nil {
 		log.Fatalf("identity: %v", err)
+	}
+	if *statePath == "" {
+		*statePath = filepath.Join(filepath.Dir(*keyPath), "tasks.json")
 	}
 
 	self, err := identity.NewCard(*agentID, "afepd", kp, func(c *afepv1.AgentCard) {
@@ -41,8 +58,10 @@ func main() {
 			GrpcAddress:       *listen,
 			NatsSubjectPrefix: "afep." + *domain + "." + sanitize(*agentID),
 		}
-		c.Capabilities = []*afepv1.Capability{{Name: "demo.echo", Version: "0.1"}}
-		c.SecurityClearances = []string{"domain:" + *domain}
+		for _, name := range splitCSV(*capability) {
+			c.Capabilities = append(c.Capabilities, &afepv1.Capability{Name: name, Version: "0.1"})
+		}
+		c.SecurityClearances = splitCSV(*clearances)
 	})
 	if err != nil {
 		log.Fatalf("card: %v", err)
@@ -52,23 +71,56 @@ func main() {
 	if err := reg.Put(self); err != nil {
 		log.Fatalf("registry: %v", err)
 	}
+	store, err := taskstore.Open(*statePath)
+	if err != nil {
+		log.Fatalf("taskstore: %v", err)
+	}
+	svc, err := grpcsvc.New(self, reg, kp,
+		grpcsvc.WithBidScore(*bidScore),
+		grpcsvc.WithTaskStore(store))
+	if err != nil {
+		log.Fatalf("service: %v", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Mesh is optional per site: without NATS the daemon still serves gRPC.
+	// --- optional mesh -------------------------------------------------
+	var bus *natsbus.Bus
 	if *natsURL != "" {
-		bus, err := natsbus.Dial(ctx, *natsURL)
+		b, err := natsbus.Dial(ctx, *natsURL)
 		if err != nil {
 			log.Printf("nats: mesh disabled (%v)", err)
 		} else {
+			bus = b
 			defer bus.Close()
 			if err := bus.PutCard(ctx, self); err != nil {
 				log.Printf("nats: card publish: %v", err)
 			}
+			var rt *router.Router
+			if peerList := splitCSV(*peers); len(peerList) > 0 {
+				if rt, err = router.New(*domain, peerList, 0); err != nil {
+					log.Fatalf("router: %v", err)
+				}
+				log.Printf("mesh: escalation peers %v (max %d hops)", rt.Peers(), router.DefaultMaxHops)
+			}
+			handler, err := mesh.New(mesh.Config{
+				Domain: *domain, Self: self, Key: kp, Score: *bidScore,
+				Router: rt, Bids: bus, Relay: bus,
+			})
+			if err != nil {
+				log.Fatalf("mesh: %v", err)
+			}
 			durable := "afepd-" + sanitize(*agentID)
 			if _, err := bus.SubscribeEnvelopes(ctx, *domain, durable, func(env *afepv1.TaskEnvelope) error {
-				log.Printf("mesh: task=%s state=%s cap=%s", env.GetTaskId(), env.GetState(), env.GetCapability())
+				if err := handler.OnEnvelope(ctx, env); err != nil {
+					if errors.Is(err, mesh.ErrRejected) {
+						return natsbus.ErrTerm // poison: stop redelivering
+					}
+					return err // transient: Nak + redelivery
+				}
+				log.Printf("mesh: handled task=%s state=%s cap=%s hops=%d",
+					env.GetTaskId(), env.GetState(), env.GetCapability(), env.GetHops())
 				return nil
 			}); err != nil {
 				log.Printf("nats: subscribe: %v", err)
@@ -78,32 +130,91 @@ func main() {
 		}
 	}
 
-	lis, err := net.Listen("tcp", *listen)
+	// --- gRPC over TCP -------------------------------------------------
+	servers := []*grpc.Server{}
+
+	tcpLn, err := net.Listen("tcp", *listen)
 	if err != nil {
-		log.Fatalf("listen: %v", err)
+		log.Fatalf("listen %s: %v", *listen, err)
 	}
-	grpcServer := grpc.NewServer()
-	afepv1.RegisterAgentTransportServiceServer(grpcServer, grpcsvc.New(self, reg))
+	tcpSrv := grpc.NewServer()
+	afepv1.RegisterAgentTransportServiceServer(tcpSrv, svc)
+	servers = append(servers, tcpSrv)
 	go func() {
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Printf("grpc: %v", err)
+		if err := tcpSrv.Serve(tcpLn); err != nil {
+			log.Printf("grpc/tcp: %v", err)
 		}
 	}()
-	log.Printf("afepd: gRPC on %s (id=%s key=%s)", *listen, *agentID, *keyPath)
+	log.Printf("afepd: gRPC/TCP on %s (id=%s)", *listen, *agentID)
+
+	// --- gRPC over QUIC (optional) ------------------------------------
+	if *listenQUIC != "" {
+		qln, err := quictransport.Listen(*listenQUIC)
+		if err != nil {
+			log.Fatalf("quic listen: %v", err)
+		}
+		qSrv := grpc.NewServer()
+		afepv1.RegisterAgentTransportServiceServer(qSrv, svc)
+		servers = append(servers, qSrv)
+		go func() {
+			if err := qSrv.Serve(qln); err != nil {
+				log.Printf("grpc/quic: %v", err)
+			}
+		}()
+		log.Printf("afepd: gRPC/QUIC on %s (ALPN %s)", *listenQUIC, quictransport.ALPN)
+	}
+
+	// --- A2A well-known card (optional) --------------------------------
+	var httpSrv *http.Server
+	if *httpListen != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/", a2a.Handler(self))
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		})
+		httpSrv = &http.Server{Addr: *httpListen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("http: %v", err)
+			}
+		}()
+		log.Printf("afepd: A2A card at http://%s%s", *httpListen, a2a.WellKnownPath)
+	}
+
+	log.Printf("afepd: ready (key=%s state=%s score=%d)", *keyPath, *statePath, *bidScore)
 
 	<-ctx.Done()
 	log.Print("afepd: shutting down")
-	done := make(chan struct{})
-	go func() { grpcServer.GracefulStop(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		grpcServer.Stop()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if httpSrv != nil {
+		_ = httpSrv.Shutdown(shutdownCtx)
 	}
+	for _, s := range servers {
+		done := make(chan struct{})
+		go func(s *grpc.Server) { s.GracefulStop(); close(done) }(s)
+		select {
+		case <-done:
+		case <-shutdownCtx.Done():
+			s.Stop()
+		}
+	}
+	log.Print("afepd: stopped")
 }
 
 func sanitize(id string) string {
-	return strings.NewReplacer("/", "-", " ", "-").Replace(id)
+	return strings.NewReplacer("/", "-", " ", "-", "\\", "-").Replace(id)
+}
+
+func splitCSV(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func defaultKeyPath() string {

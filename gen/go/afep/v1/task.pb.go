@@ -100,8 +100,10 @@ type Bid struct {
 	Rationale            string `protobuf:"bytes,3,opt,name=rationale,proto3" json:"rationale,omitempty"`
 	ProposedDeadlineUnix int64  `protobuf:"varint,4,opt,name=proposed_deadline_unix,json=proposedDeadlineUnix,proto3" json:"proposed_deadline_unix,omitempty"`
 	Signature            []byte `protobuf:"bytes,5,opt,name=signature,proto3" json:"signature,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Task this bid answers — mesh correlation; covered by the signature.
+	TaskId        string `protobuf:"bytes,6,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Bid) Reset() {
@@ -167,6 +169,13 @@ func (x *Bid) GetSignature() []byte {
 		return x.Signature
 	}
 	return nil
+}
+
+func (x *Bid) GetTaskId() string {
+	if x != nil {
+		return x.TaskId
+	}
+	return ""
 }
 
 // Deadline bounds the task lifetime.
@@ -315,7 +324,10 @@ type TaskEnvelope struct {
 	UpdatedAtUnix int64       `protobuf:"varint,13,opt,name=updated_at_unix,json=updatedAtUnix,proto3" json:"updated_at_unix,omitempty"`
 	// Issuer ed25519 signature over the deterministic serialization with
 	// the signature field cleared.
-	Signature     []byte `protobuf:"bytes,14,opt,name=signature,proto3" json:"signature,omitempty"`
+	Signature []byte `protobuf:"bytes,14,opt,name=signature,proto3" json:"signature,omitempty"`
+	// Cross-domain relay hop count; routers refuse envelopes above the
+	// configured maximum, preventing domain ping-pong.
+	Hops          uint32 `protobuf:"varint,15,opt,name=hops,proto3" json:"hops,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -448,17 +460,25 @@ func (x *TaskEnvelope) GetSignature() []byte {
 	return nil
 }
 
+func (x *TaskEnvelope) GetHops() uint32 {
+	if x != nil {
+		return x.Hops
+	}
+	return 0
+}
+
 var File_afep_v1_task_proto protoreflect.FileDescriptor
 
 const file_afep_v1_task_proto_rawDesc = "" +
 	"\n" +
-	"\x12afep/v1/task.proto\x12\aafep.v1\"\xa8\x01\n" +
+	"\x12afep/v1/task.proto\x12\aafep.v1\"\xc1\x01\n" +
 	"\x03Bid\x12\x19\n" +
 	"\bagent_id\x18\x01 \x01(\tR\aagentId\x12\x14\n" +
 	"\x05score\x18\x02 \x01(\x04R\x05score\x12\x1c\n" +
 	"\trationale\x18\x03 \x01(\tR\trationale\x124\n" +
 	"\x16proposed_deadline_unix\x18\x04 \x01(\x03R\x14proposedDeadlineUnix\x12\x1c\n" +
-	"\tsignature\x18\x05 \x01(\fR\tsignature\"L\n" +
+	"\tsignature\x18\x05 \x01(\fR\tsignature\x12\x17\n" +
+	"\atask_id\x18\x06 \x01(\tR\x06taskId\"L\n" +
 	"\bDeadline\x12\x1d\n" +
 	"\n" +
 	"start_unix\x18\x01 \x01(\x03R\tstartUnix\x12!\n" +
@@ -470,7 +490,7 @@ const file_afep_v1_task_proto_rawDesc = "" +
 	"\tto_domain\x18\x02 \x01(\tR\btoDomain\x12\x1f\n" +
 	"\vreason_code\x18\x03 \x01(\tR\n" +
 	"reasonCode\x12\x16\n" +
-	"\x06detail\x18\x04 \x01(\tR\x06detail\"\xfe\x03\n" +
+	"\x06detail\x18\x04 \x01(\tR\x06detail\"\x92\x04\n" +
 	"\fTaskEnvelope\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12 \n" +
 	"\froot_task_id\x18\x02 \x01(\tR\n" +
@@ -491,7 +511,8 @@ const file_afep_v1_task_proto_rawDesc = "" +
 	"escalation\x18\f \x01(\v2\x13.afep.v1.EscalationR\n" +
 	"escalation\x12&\n" +
 	"\x0fupdated_at_unix\x18\r \x01(\x03R\rupdatedAtUnix\x12\x1c\n" +
-	"\tsignature\x18\x0e \x01(\fR\tsignature*\xc6\x01\n" +
+	"\tsignature\x18\x0e \x01(\fR\tsignature\x12\x12\n" +
+	"\x04hops\x18\x0f \x01(\rR\x04hops*\xc6\x01\n" +
 	"\tTaskState\x12\x1a\n" +
 	"\x16TASK_STATE_UNSPECIFIED\x10\x00\x12\x14\n" +
 	"\x10TASK_STATE_PROBE\x10\x01\x12\x12\n" +

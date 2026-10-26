@@ -29,6 +29,8 @@ message Bid {
   string rationale = 3;
   int64 proposed_deadline_unix = 4;
   bytes signature = 5;
+  // Task this bid answers — mesh correlation; covered by the signature.
+  string task_id = 6;
 }
 
 // Deadline bounds the task lifetime.
@@ -69,4 +71,7 @@ message TaskEnvelope {
   // Issuer ed25519 signature over the deterministic serialization with
   // the signature field cleared.
   bytes signature = 14;
+  // Cross-domain relay hop count; routers refuse envelopes above the
+  // configured maximum, preventing domain ping-pong.
+  uint32 hops = 15;
 }

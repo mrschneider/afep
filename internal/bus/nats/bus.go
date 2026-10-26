@@ -2,7 +2,9 @@ package natsbus
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	afepv1 "github.com/mrschneider/afep/gen/go/afep/v1"
@@ -34,9 +36,9 @@ func Dial(ctx context.Context, url string) (*Bus, error) {
 		nc.Close()
 		return nil, fmt.Errorf("afep/natsbus: jetstream: %w", err)
 	}
-	_, err = js.CreateStream(ctx, jetstream.StreamConfig{
+	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:       StreamName,
-		Subjects:   []string{"afep.>"},
+		Subjects:   []string{"afep.*.*.envelopes"},
 		Storage:    jetstream.FileStorage,
 		Retention:  jetstream.LimitsPolicy,
 		MaxAge:     24 * time.Hour,
@@ -72,13 +74,21 @@ func (b *Bus) PublishEnvelope(ctx context.Context, domain, agent string, env *af
 		msg.Header = make(nats.Header)
 	}
 	msg.Data = body
-	msg.Header.Set(nats.MsgIdHdr, env.GetTaskId())
+	// Dedup key must distinguish lifecycle hops: a probe and its escalation
+	// share the task id, and JetStream de-dups MsgId stream-wide (a plain
+	// task id would silently swallow the escalation as a "duplicate").
+	msg.Header.Set(nats.MsgIdHdr,
+		env.GetTaskId()+":"+env.GetState().String()+":"+strconv.FormatUint(uint64(env.GetHops()), 10))
 	msg.Header.Set("AFEP-State", env.GetState().String())
 	if _, err := b.js.PublishMsg(ctx, msg); err != nil {
 		return fmt.Errorf("afep/natsbus: publish: %w", err)
 	}
 	return nil
 }
+
+// ErrTerm returned by an EnvelopeHandler marks the message as poison: it
+// is discarded instead of redelivered forever.
+var ErrTerm = errors.New("afep/natsbus: term")
 
 // EnvelopeHandler returns nil to ack the message or an error to redeliver.
 type EnvelopeHandler func(*afepv1.TaskEnvelope) error
@@ -106,7 +116,11 @@ func (b *Bus) SubscribeEnvelopes(ctx context.Context, domain, durable string, h 
 			return
 		}
 		if err := h(env); err != nil {
-			_ = msg.Nak()
+			if errors.Is(err, ErrTerm) {
+				_ = msg.Term()
+			} else {
+				_ = msg.Nak()
+			}
 			return
 		}
 		_ = msg.Ack()
@@ -154,4 +168,46 @@ func (b *Bus) GetCard(ctx context.Context, id string) (*afepv1.AgentCard, bool, 
 		return nil, false, fmt.Errorf("afep/natsbus: unmarshal: %w", err)
 	}
 	return card, true, nil
+}
+
+// PublishBid fires an ephemeral signed bid over core NATS (at-most-once):
+// bids are request-scoped and re-probing beats redelivery.
+func (b *Bus) PublishBid(domain, agent string, bid *afepv1.Bid) error {
+	subject, err := Subject(domain, agent, VerbBids)
+	if err != nil {
+		return err
+	}
+	body, err := proto.MarshalOptions{Deterministic: true}.Marshal(bid)
+	if err != nil {
+		return fmt.Errorf("afep/natsbus: marshal bid: %w", err)
+	}
+	msg := &nats.Msg{Subject: subject, Data: body, Header: make(nats.Header)}
+	msg.Header.Set(nats.MsgIdHdr, bid.GetTaskId()+":"+bid.GetAgentId())
+	if err := b.nc.PublishMsg(msg); err != nil {
+		return fmt.Errorf("afep/natsbus: publish bid: %w", err)
+	}
+	return nil
+}
+
+// BidHandler receives a bid from afep.<domain>.*.bids.
+type BidHandler func(domain, agent string, bid *afepv1.Bid)
+
+// SubscribeBids returns an ephemeral subscription for bid collection;
+// core NATS, so only live responders are seen (re-probe recovers misses).
+func (b *Bus) SubscribeBids(domain string, h BidHandler) (*nats.Subscription, error) {
+	filter, err := Subject(domain, Wildcard, VerbBids)
+	if err != nil {
+		return nil, err
+	}
+	return b.nc.Subscribe(filter, func(m *nats.Msg) {
+		d, a, _, err := ParseSubject(m.Subject)
+		if err != nil {
+			return
+		}
+		bid := &afepv1.Bid{}
+		if err := proto.Unmarshal(m.Data, bid); err != nil {
+			return
+		}
+		h(d, a, bid)
+	})
 }

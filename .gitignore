@@ -2,3 +2,6 @@
 *.log
 coverage.out
 .DS_Store
+.venv/
+__pycache__/
+*.pyc

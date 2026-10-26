@@ -1,0 +1,24 @@
+{
+  "task_id": "go-task-1",
+  "root_task_id": "go-root-1",
+  "tenant": "acme",
+  "issuer_agent": "go/interop",
+  "assignee_agent": "go/worker",
+  "state": 2,
+  "capability": "vision.tag",
+  "payload_type": "application/json",
+  "payload": "7b226e223a377d",
+  "deadline": {
+    "start_unix": 1793000050,
+    "expires_unix": 1793003650
+  },
+  "escalation": {
+    "from_domain": "beta",
+    "to_domain": "alpha",
+    "reason_code": "NO_BIDS",
+    "detail": "hops=2"
+  },
+  "updated_at_unix": 1793000100,
+  "hops": 2,
+  "signature": "dfa7cdf5b1a73d5a8f25ea9f3f8d3a6dee832248be512b554b02052e2753ed73f7982f21da9122fecf26260e92d9346755cf892d83ca20387ef02a4fb987ca02"
+}
