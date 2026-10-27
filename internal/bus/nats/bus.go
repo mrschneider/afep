@@ -7,6 +7,7 @@ import (
 	"log"
 	"runtime/debug"
 	"strconv"
+	"sync"
 	"time"
 
 	afepv1 "github.com/mrschneider/afep/gen/go/afep/v1"
@@ -17,14 +18,26 @@ import (
 
 // Stream and KV bucket names shared across federated sites.
 const (
-	StreamName = "AFEP_TASKS"
-	CardBucket = "afep_cards"
+	StreamName    = "AFEP_TASKS"
+	BidStreamName = "AFEP_BIDS"
+	CardBucket    = "afep_cards"
 )
 
 // Bus is the JetStream-backed message mesh.
 type Bus struct {
 	nc *nats.Conn
 	js jetstream.JetStream
+	// kv is created ONCE in Dial: CreateKeyValue runs CreateStream
+	// server-side (kv.go:540), so the old per-call handle cost a
+	// metadata roundtrip on EVERY card read/write.
+	kv  jetstream.KeyValue
+	kvL sync.RWMutex
+	// cardCache mirrors the KV bucket fed by WatchAll: issuer lookups
+	// on the per-envelope verify path read it with zero RTT.
+	cardCache map[string][]byte
+	kvStop    context.CancelFunc
+	// statsCons (set at subscribe) feeds the observability ticker.
+	statsCons jetstream.Consumer
 }
 
 // Dial connects to NATS and (re)creates the AFEP stream.
@@ -58,26 +71,61 @@ func Dial(ctx context.Context, url string) (*Bus, error) {
 		return nil, fmt.Errorf("afep/natsbus: jetstream: %w", err)
 	}
 	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:       StreamName,
-		Subjects:   []string{"afep.*.*.envelopes"},
-		Storage:    jetstream.FileStorage,
-		Retention:  jetstream.LimitsPolicy,
-		MaxAge:     24 * time.Hour,
-		MaxBytes:   1 << 30, // 1 GiB cap: an inundation must not fill the disk
-		Discard:    jetstream.DiscardOld,
-		Duplicates: 2 * time.Minute,
+		Name:        StreamName,
+		Subjects:    []string{"afep.*.*.envelopes"},
+		Storage:     jetstream.FileStorage,
+		Retention:   jetstream.LimitsPolicy,
+		MaxAge:      24 * time.Hour,
+		MaxBytes:    1 << 30,   // 1 GiB cap: an inundation must not fill the disk
+		MaxMsgs:     1_000_000, // third cut dimension beside age and bytes
+		Discard:     jetstream.DiscardOld,
+		Compression: jetstream.S2Compression, // proto payloads compress well
+		AllowDirect: true,                    // ops reads by sequence without a consumer
+		Duplicates:  2 * time.Minute,
 	})
 	if err != nil {
 		nc.Close()
 		return nil, fmt.Errorf("afep/natsbus: stream %w", err)
 	}
-	return &Bus{nc: nc, js: js}, nil
+	// Bid archive: the live path below stays ephemeral core NATS, this
+	// stream only makes ranks reconstructable after a restart.
+	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:        BidStreamName,
+		Subjects:    []string{"afep.*.*.bids"},
+		Storage:     jetstream.FileStorage,
+		Retention:   jetstream.LimitsPolicy,
+		MaxAge:      24 * time.Hour,
+		MaxBytes:    256 << 20,
+		MaxMsgs:     500_000,
+		Discard:     jetstream.DiscardOld,
+		Compression: jetstream.S2Compression,
+		AllowDirect: true,
+		Duplicates:  2 * time.Minute,
+	})
+	if err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("afep/natsbus: bid stream %w", err)
+	}
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: CardBucket,
+		TTL:    7 * 24 * time.Hour,
+	})
+	if err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("afep/natsbus: kv bucket: %w", err)
+	}
+	b := &Bus{nc: nc, js: js, kv: kv, cardCache: make(map[string][]byte)}
+	b.startCardWatcher(ctx)
+	return b, nil
 }
 
 // Close tears down the NATS connection.
 func (b *Bus) Close() {
 	if b.nc == nil {
 		return
+	}
+	if b.kvStop != nil {
+		b.kvStop()
 	}
 	// Drain flushes buffered publishes and unsubscribes consumers so a
 	// shutdown does not drop messages already handed to the client;
@@ -92,6 +140,80 @@ func (b *Bus) Close() {
 	case <-time.After(2 * time.Second):
 		b.nc.Close()
 	}
+}
+
+// startCardWatcher mirrors the card bucket into cardCache. WatchAll
+// pushes current values first (nil entry ends the snapshot), then every
+// update — issuer verification on the envelope path stops paying RTTs.
+func (b *Bus) startCardWatcher(ctx context.Context) {
+	wctx, cancel := context.WithCancel(ctx)
+	b.kvStop = cancel
+	go func() {
+		for {
+			w, err := b.kv.WatchAll(wctx)
+			if err != nil {
+				if wctx.Err() != nil {
+					return
+				}
+				log.Printf("natsbus: card watch: %v (retrying)", err)
+				select {
+				case <-wctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
+			for entry := range w.Updates() {
+				if entry == nil {
+					continue // end of the initial snapshot
+				}
+				key := entry.Key()
+				if entry.Operation() == jetstream.KeyValueDelete ||
+					entry.Operation() == jetstream.KeyValuePurge {
+					b.kvL.Lock()
+					delete(b.cardCache, key)
+					b.kvL.Unlock()
+					continue
+				}
+				b.kvL.Lock()
+				b.cardCache[key] = append([]byte(nil), entry.Value()...)
+				b.kvL.Unlock()
+			}
+			if wctx.Err() != nil {
+				return
+			}
+		}
+	}()
+}
+
+// LogStatsEvery logs stream and consumer counters: pending lag and
+// redeliveries were previously invisible in the daemon.
+func (b *Bus) LogStatsEvery(ctx context.Context, every time.Duration) {
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if st, err := b.js.Stream(sctx, StreamName); err == nil {
+				if info, ierr := st.Info(sctx); ierr == nil {
+					log.Printf("jetstream: %s msgs=%d bytes=%d consumers=%d",
+						StreamName, info.State.Msgs, info.State.Bytes, info.State.Consumers)
+				}
+			}
+			if b.statsCons != nil {
+				if ci, cerr := b.statsCons.Info(sctx); cerr == nil {
+					log.Printf("jetstream: consumer pending=%d ack-pending=%d redelivered=%d",
+						ci.NumPending, ci.NumAckPending, ci.NumRedelivered)
+				}
+			}
+			cancel()
+		}
+	}()
 }
 
 // PublishEnvelope publishes with at-least-once semantics; JetStream
@@ -151,15 +273,38 @@ func (b *Bus) SubscribeEnvelopes(ctx context.Context, domain, durable string, h 
 	if err != nil {
 		return nil, err
 	}
-	cons, err := b.js.CreateOrUpdateConsumer(ctx, StreamName, jetstream.ConsumerConfig{
+	cfg := jetstream.ConsumerConfig{
 		Durable:       durable,
 		FilterSubject: filter,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		MaxDeliver:    5,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("afep/natsbus: consumer: %w", err)
+		// Fresh durables start at the tail: the DeliverAll default would
+		// replay the whole retained stream (up to 24h/1GiB) as new work
+		// on a first boot.
+		DeliverPolicy: jetstream.DeliverNewPolicy,
+		// Explicit ack window covering slow handlers; server-side BackOff
+		// is the safety net for SILENT handlers (neither Ack nor Nak) —
+		// explicit failures still use NakWithDelay in the loop below.
+		AckWait: 60 * time.Second,
+		BackOff: []time.Duration{60 * time.Second, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 30 * time.Minute},
+		// Single-threaded handler: bound the unacked work in flight.
+		MaxAckPending: 100,
 	}
+	cons, err := b.js.CreateOrUpdateConsumer(ctx, StreamName, cfg)
+	if err != nil {
+		// deliver_policy is immutable: a pre-existing durable created
+		// with the DeliverAll default must be recreated at the tail
+		// (logged; any backlog older than this restart is skipped).
+		if derr := b.js.DeleteConsumer(ctx, StreamName, durable); derr != nil {
+			return nil, fmt.Errorf("afep/natsbus: consumer: %w", err)
+		}
+		log.Printf("natsbus: consumer %s recreated at tail (deliver_policy migration)", durable)
+		cons, err = b.js.CreateOrUpdateConsumer(ctx, StreamName, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("afep/natsbus: consumer recreate: %w", err)
+		}
+	}
+	b.statsCons = cons
 	cc, err := cons.Consume(func(msg jetstream.Msg) {
 		// A handler panic must not take the whole daemon down: term the
 		// message, log the stack, keep the consumer alive.
@@ -174,6 +319,7 @@ func (b *Bus) SubscribeEnvelopes(ctx context.Context, domain, durable string, h 
 			_ = msg.Term() // poison message: stop redelivering it
 			return
 		}
+		_ = msg.InProgress() // extend the ack window across handler execution
 		if err := h(env); err != nil {
 			if errors.Is(err, ErrTerm) {
 				_ = msg.Term()
@@ -198,38 +344,44 @@ func (b *Bus) SubscribeEnvelopes(ctx context.Context, domain, durable string, h 
 
 // PutCard stores a signed card in the KV bucket.
 func (b *Bus) PutCard(ctx context.Context, card *afepv1.AgentCard) error {
-	kv, err := b.js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket: CardBucket,
-		TTL:    7 * 24 * time.Hour,
-	})
-	if err != nil {
-		return fmt.Errorf("afep/natsbus: kv bucket: %w", err)
+	if b.kv == nil {
+		return errors.New("afep/natsbus: kv not initialized")
 	}
 	body, err := proto.MarshalOptions{Deterministic: true}.Marshal(card)
 	if err != nil {
 		return fmt.Errorf("afep/natsbus: marshal: %w", err)
 	}
-	if _, err := kv.Put(ctx, card.GetId(), body); err != nil {
+	if _, err := b.kv.Put(ctx, card.GetId(), body); err != nil {
 		return fmt.Errorf("afep/natsbus: kv put: %w", err)
 	}
+	// instant mirror hit; the watcher will confirm the same bytes
+	b.kvL.Lock()
+	b.cardCache[card.GetId()] = body
+	b.kvL.Unlock()
 	return nil
 }
 
 // GetCard loads a card from KV; ok is false when absent.
 func (b *Bus) GetCard(ctx context.Context, id string) (*afepv1.AgentCard, bool, error) {
-	kv, err := b.js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: CardBucket, TTL: 7 * 24 * time.Hour})
-	if err != nil {
-		return nil, false, fmt.Errorf("afep/natsbus: kv bucket: %w", err)
+	if b.kv == nil {
+		return nil, false, errors.New("afep/natsbus: kv not initialized")
 	}
-	entry, err := kv.Get(ctx, id)
-	if err != nil {
-		if err == jetstream.ErrKeyNotFound {
-			return nil, false, nil
+	b.kvL.RLock()
+	raw, hit := b.cardCache[id]
+	b.kvL.RUnlock()
+	if !hit {
+		// watch missed it (cold start / rotation): authoritative read
+		entry, err := b.kv.Get(ctx, id)
+		if err != nil {
+			if err == jetstream.ErrKeyNotFound {
+				return nil, false, nil
+			}
+			return nil, false, fmt.Errorf("afep/natsbus: kv get: %w", err)
 		}
-		return nil, false, fmt.Errorf("afep/natsbus: kv get: %w", err)
+		raw = entry.Value()
 	}
 	card := &afepv1.AgentCard{}
-	if err := proto.Unmarshal(entry.Value(), card); err != nil {
+	if err := proto.Unmarshal(raw, card); err != nil {
 		return nil, false, fmt.Errorf("afep/natsbus: unmarshal: %w", err)
 	}
 	return card, true, nil
@@ -250,6 +402,15 @@ func (b *Bus) PublishBid(domain, agent string, bid *afepv1.Bid) error {
 	msg.Header.Set(nats.MsgIdHdr, bid.GetTaskId()+":"+bid.GetAgentId())
 	if err := b.nc.PublishMsg(msg); err != nil {
 		return fmt.Errorf("afep/natsbus: publish bid: %w", err)
+	}
+	// Best-effort JetStream archive (live path above is the contract):
+	// same payload + MsgId, so replays stay idempotent per task+agent.
+	actx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	am := &nats.Msg{Subject: subject, Data: body, Header: make(nats.Header)}
+	am.Header.Set(nats.MsgIdHdr, bid.GetTaskId()+":"+bid.GetAgentId())
+	if _, err := b.js.PublishMsg(actx, am); err != nil {
+		log.Printf("natsbus: bid archive: %v", err) // non-fatal
 	}
 	return nil
 }

@@ -106,6 +106,7 @@ func main() {
 		} else {
 			bus = b
 			defer bus.Close()
+			bus.LogStatsEvery(ctx, 5*time.Minute) // pending/redeliveries visibility
 			if err := bus.PutCard(ctx, self); err != nil {
 				log.Printf("nats: card publish: %v", err)
 			}
