@@ -1,6 +1,6 @@
 # AFEP Architecture
 
-Engineering reference for v0.3.0. Every number here is read from source
+Engineering reference for v0.4.0. Every number here is read from source
 (LOC via `grep -c`, test counts from `grep "func Test"` / `def test_`,
 contracts counted in `proto/afep/v1/`).
 
@@ -74,16 +74,16 @@ Python reference: **814 LOC**, **25 tests**; contracts: 4 proto files,
 
 | Package | LOC | Tests | Role |
 |---|---|---|---|
-| `cmd/afepd` | 279 | - | flags, key custody, mesh/QUIC/HTTP wiring, prune loop |
+| `cmd/afepd` | 303 | - | flags, key custody, mesh/QUIC/HTTP wiring, prune loop |
 | `internal/identity` | 462 | 16 | card/bid/envelope signing (deterministic body) |
-| `internal/transport/grpcsvc` | 689 | 11 | RPCs: signed bids, clearances, schema gate, store |
-| `internal/bus/nats` | 557 | 6 | stream/KV/bids, durable consume, Term-on-poison |
+| `internal/transport/grpcsvc` | 732 | 11 | RPCs: signed bids, clearances, schema gate, store |
+| `internal/bus/nats` | 622 | 6 | stream/KV/bids, durable consume, Term-on-poison |
 | `internal/a2a` | 362 | 8 | A2A card derivation, state map, well-known handler |
 | `internal/mesh` | 530 | 11 | inbound policy: verify issuer, serve / escalate / drop |
-| `internal/quictransport` | 390 | 3 | QUIC listener/dialer, stream->net.Conn, TLS bootstrap |
+| `internal/quictransport` | 435 | 3 | QUIC listener/dialer, stream->net.Conn, TLS bootstrap |
 | `internal/router` | 273 | 8 | escalation with hop budget and peer ordering |
 | `internal/interop` | 292 | 3 | fixture generation + cross-language verification |
-| `internal/taskstore` | 247 | 4 | atomic persistence + terminal pruning |
+| `internal/taskstore` | 294 | 4 | atomic persistence + terminal pruning |
 | `pkg/client` | 242 | 3 | ProbeAll: fan-out, verify, rank |
 | `internal/schemareg` | 189 | 8 | media-type registry and payload validation |
 | `internal/lifecycle` | 149 | 3 | transition table + Apply |

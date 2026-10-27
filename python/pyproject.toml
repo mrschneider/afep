@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "afep"
-version = "0.3.0"
+version = "0.4.0"
 description = "AFEP Python reference: identity, lifecycle, subject scheme, interop fixtures"
 readme = "README.md"
 license = { file = "LICENSE" }

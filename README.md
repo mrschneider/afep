@@ -119,6 +119,6 @@ docs/ARCHITECTURE.md          technical reference (incl. honest residuals)
 
 ## Status
 
-v0.3.0 — experimental. All v0.1.0 gaps are closed; the current honest
+v0.4.0 — experimental. All v0.1.0 gaps are closed; the current honest
 residuals live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 License: MIT.

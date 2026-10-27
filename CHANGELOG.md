@@ -3,6 +3,43 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-10-26
+
+### Changed
+
+- Taskstore flush cost: protojson runs once per `Put` (per-task `raws`
+  cache, bytes preserved from disk at boot) instead of re-encoding every
+  stored envelope on each flush — identical full-snapshot tmp+rename
+  durability, directory fsync added after the rename.
+- Envelope ownership: `taskstore.Put`/`Get` and the gRPC save/load paths
+  clone at every boundary, so the documented "callers own the value"
+  contract holds and RPC request objects never alias the store; removes
+  the Probe/Commit data race caught by `go test -race` (3-4 warnings per
+  10 runs before, 0 after).
+- NATS connection: explicit reconnect policy (unlimited, 2s wait) with
+  logged disconnect/reconnect/close events; `Close()` now drains
+  in-flight traffic with a 2s bound instead of dropping it.
+- Redelivery: `NakWithDelay` backoff 1s..30s by delivery count instead
+  of an immediate NAK loop.
+- QUIC certificate persists next to the identity seed
+  (`LoadOrCreateCert`, key 0600): stable federation identity across
+  restarts instead of a fresh fingerprint per boot.
+
+### Added
+
+- Panic containment: gRPC unary/stream recovery interceptors
+  (`codes.Internal` + stack) and `recover()` in the NATS consume
+  callback (log + Term) — handler panics no longer kill the daemon.
+- gRPC health service on both servers (TCP + QUIC), flipped to
+  NOT_SERVING at shutdown (`/healthz` already existed on HTTP).
+- `go test -race` gate in CI and in `make test`.
+- Taskstore bounds: `-max-tasks` cap (default 100k, 0 = unlimited) so
+  `-prune-age=0` is no longer an unbounded store.
+- JetStream stream `MaxBytes` (1 GiB) + `DiscardOld`: an inundation
+  cannot fill the disk.
+- Per-message 10s deadline inside the consume handler (the subscribe
+  context had none).
+
 ## [0.3.0] - 2026-10-26
 
 ### Added
