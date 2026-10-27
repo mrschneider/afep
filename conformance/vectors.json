@@ -1,0 +1,43 @@
+{
+  "bid": {
+    "agent_id": "vector/agent",
+    "proposed_deadline_unix": 1700003600,
+    "rationale": "vector",
+    "score": 42,
+    "signature_hex": "d4a8de4a21cb75ac122cb42775ade8d4d7de2328202396821cb89e5b51a4ef55d25b8913bd1d54d672ad92c7dee57505c5ea6c895d0f457d5a06a35557f1a703",
+    "signed_body_hex": "0a0c766563746f722f6167656e74102a1a06766563746f722090fecfaa06320b766563746f722d7461736b",
+    "task_id": "vector-task"
+  },
+  "card": {
+    "display_name": "AFEP vector",
+    "id": "vector/agent",
+    "issued_at_unix": 1700000000,
+    "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "signature_hex": "b21c65c11b5d75ba5bef13c0e8b08702ef381c87abe40055f3d27c7db46756b344e9fd2f68ac10790d8c0710591ba66b783482709daa1094813af1f642eb9a09",
+    "signed_body_hex": "0a0c766563746f722f6167656e74120b4146455020766563746f721a2003a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b84080e2cfaa06"
+  },
+  "envelope": {
+    "capability": "vector.cap",
+    "deadline_expires_unix": 1700003600,
+    "deadline_start_unix": 1700000000,
+    "issuer_agent": "vector/agent",
+    "payload_hex": "616665702d636f6e666f726d616e63652d7061796c6f6164",
+    "payload_type": "application/x-afep-vector",
+    "root_task_id": "vector-task",
+    "signature_hex": "31e3bbe6c533c207043f185c79f9d3aae87f8fa8ea823a25698ff007b19d1d1e9d9459ef555550d67abca882b6e774ff0837c33193f3fb859b3fd9e7cb0aee0f",
+    "signed_core_hex": "0a0b766563746f722d7461736b120b766563746f722d7461736b1a0d74656e616e743a766563746f72220c766563746f722f6167656e743a0a766563746f722e63617042196170706c69636174696f6e2f782d616665702d766563746f724a18616665702d636f6e666f726d616e63652d7061796c6f61645a0c0880e2cfaa061090fecfaa06",
+    "state": 1,
+    "task_id": "vector-task",
+    "tenant": "tenant:vector"
+  },
+  "note": "AFEP cross-language conformance vectors. TEST KEY - NOT FOR PRODUCTION. Byte-locked: regenerate ONLY with this script after an intentional, versioned signed-core/wire change.",
+  "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "subject": {
+    "agent": "tenant/vector",
+    "dedup_key": "vector-task:TASK_STATE_PROBE:0",
+    "domain": "vector",
+    "subject": "afep.vector.tenant/vector.envelopes",
+    "verb": "envelopes"
+  },
+  "version": 1
+}

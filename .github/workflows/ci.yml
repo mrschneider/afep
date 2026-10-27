@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # buf breaking needs history
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -20,6 +22,8 @@ jobs:
           go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
       - name: buf lint
         run: buf lint
+      - name: buf breaking (vs previous commit)
+        run: buf breaking --against '.git#ref=HEAD~1'
       - name: generated Go stubs up to date
         run: |
           buf generate
@@ -27,6 +31,16 @@ jobs:
 
   go:
     runs-on: ubuntu-latest
+    services:
+      nats:
+        image: nats:2.10-alpine
+        ports:
+          - 4222:4222
+        options: >-
+          --health-cmd "nc -z 127.0.0.1 4222"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -43,7 +57,12 @@ jobs:
         run: |
           go build -o bin/afepd ./cmd/afepd
           ./bin/afepd -h
-      - run: go test -race -count=1 ./...
+      - run: go test -race -count=1 ./... # live Jetstream test runs against the service
+      - name: fuzz smoke
+        run: |
+          go test -run='^$' -fuzz=FuzzParseSubject -fuzztime=10s ./internal/bus/nats/
+          go test -run='^$' -fuzz=FuzzTaskstoreOpen -fuzztime=10s ./internal/taskstore/
+          go test -run='^$' -fuzz=FuzzEnvelopeBytes -fuzztime=10s ./internal/identity/
 
   python:
     runs-on: ubuntu-latest

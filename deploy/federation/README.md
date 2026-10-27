@@ -45,3 +45,24 @@ Leafnode federation is the templated pattern here. NATS **superclusters**
 namespace model, more moving parts; not templated yet (see
 ARCHITECTURE.md residuals). Configs are dev-grade: add TLS and
 leafnode authentication before anything crosses a real network.
+
+
+## Backups
+
+- **Task store** (afepd): copy the `-state` file (default
+  `<keydir>/tasks.json`) while the daemon is stopped, or rsync it
+  periodically — it is an atomic snapshot, any copy is consistent.
+- **JetStream**: `docker exec afep-core nats stream backup AFEP_TASKS
+  ./backup` and the same for `AFEP_BIDS`; cards and revocations:
+  `nats kv backup afep_cards ./backup`. Restore with `nats stream
+  restore` / `nats kv restore` against a fresh server.
+- **Identity**: the ed25519 seed at `-key` (0600) IS the domain
+  identity — back it up offline, never commit it.
+
+## Authentication
+
+Both configs enable user/password auth with CHANGE_ME_* placeholders
+(validated with `nats-server -t`). Replace them before deploying and
+give afepd the client credentials through the environment:
+`AFEP_NATS_USER` / `AFEP_NATS_PASS` (or `AFEP_NATS_TOKEN`,
+`AFEP_NATS_CREDS`, `AFEP_NATS_TLSCA`). TLS is still your job.

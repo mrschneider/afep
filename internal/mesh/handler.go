@@ -11,6 +11,7 @@ import (
 	afepv1 "github.com/mrschneider/afep/gen/go/afep/v1"
 	"github.com/mrschneider/afep/internal/clearance"
 	"github.com/mrschneider/afep/internal/identity"
+	"github.com/mrschneider/afep/internal/metrics"
 	"github.com/mrschneider/afep/internal/router"
 	"github.com/mrschneider/afep/internal/schemareg"
 )
@@ -38,6 +39,11 @@ func (f CardResolverFunc) Card(ctx context.Context, agentID string) (*afepv1.Age
 	return f(ctx, agentID)
 }
 
+// RevocationChecker reports revoked card ids (kv-backed in afepd).
+type RevocationChecker interface {
+	IsRevoked(ctx context.Context, id string) (bool, error)
+}
+
 // Config wires a mesh handler. Domain, Self, Key and Bids are mandatory;
 // Router is optional (no escalation without it).
 type Config struct {
@@ -50,19 +56,23 @@ type Config struct {
 	Bids    BidPublisher
 	Relay   router.Publisher
 	Issuers CardResolver
+	// Revocations (optional) fails closed on lookup errors: a revoked
+	// issuer must not earn a signed bid.
+	Revocations RevocationChecker
 }
 
 // Handler processes one inbound envelope per call.
 type Handler struct {
-	domain  string
-	self    *afepv1.AgentCard
-	kp      *identity.KeyPair
-	score   uint64
-	schemas *schemareg.Registry
-	router  *router.Router
-	bids    BidPublisher
-	relay   router.Publisher
-	issuers CardResolver
+	domain      string
+	self        *afepv1.AgentCard
+	kp          *identity.KeyPair
+	score       uint64
+	schemas     *schemareg.Registry
+	router      *router.Router
+	bids        BidPublisher
+	relay       router.Publisher
+	issuers     CardResolver
+	revocations RevocationChecker
 }
 
 const defaultScore = 100
@@ -85,15 +95,16 @@ func New(cfg Config) (*Handler, error) {
 		cfg.Score = defaultScore
 	}
 	return &Handler{
-		domain:  cfg.Domain,
-		self:    cfg.Self,
-		kp:      cfg.Key,
-		score:   cfg.Score,
-		schemas: cfg.Schemas,
-		router:  cfg.Router,
-		bids:    cfg.Bids,
-		relay:   cfg.Relay,
-		issuers: cfg.Issuers,
+		domain:      cfg.Domain,
+		self:        cfg.Self,
+		kp:          cfg.Key,
+		score:       cfg.Score,
+		schemas:     cfg.Schemas,
+		router:      cfg.Router,
+		bids:        cfg.Bids,
+		relay:       cfg.Relay,
+		issuers:     cfg.Issuers,
+		revocations: cfg.Revocations,
 	}, nil
 }
 
@@ -148,6 +159,16 @@ func (h *Handler) verifyIssuer(ctx context.Context, env *afepv1.TaskEnvelope) er
 	}
 	if !ok {
 		return fmt.Errorf("%w: unknown issuer %q", ErrRejected, issuer)
+	}
+	if h.revocations != nil {
+		revoked, rerr := h.revocations.IsRevoked(ctx, issuer)
+		if rerr != nil {
+			return fmt.Errorf("afep/mesh: revocation lookup: %w", rerr) // transient: Nak
+		}
+		if revoked {
+			metrics.RevokedRejected.Inc()
+			return fmt.Errorf("%w: issuer %q is revoked", ErrRejected, issuer)
+		}
 	}
 	if err := identity.VerifyEnvelope(env, card); err != nil {
 		return fmt.Errorf("%w: issuer signature: %v", ErrRejected, err)

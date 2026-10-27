@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	afepv1 "github.com/mrschneider/afep/gen/go/afep/v1"
+	"github.com/mrschneider/afep/internal/metrics"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/protobuf/proto"
@@ -21,6 +24,9 @@ const (
 	StreamName    = "AFEP_TASKS"
 	BidStreamName = "AFEP_BIDS"
 	CardBucket    = "afep_cards"
+	// RevokedPrefix namespaces KV keys holding revoked card ids. NATS KV
+	// forbids ":" in keys; "/" is valid (card ids already contain it).
+	RevokedPrefix = "revoked/"
 )
 
 // Bus is the JetStream-backed message mesh.
@@ -38,21 +44,29 @@ type Bus struct {
 	kvStop    context.CancelFunc
 	// statsCons (set at subscribe) feeds the observability ticker.
 	statsCons jetstream.Consumer
+	// revokedCache mirrors kv keys "revoked/<id>" (fail-closed check
+	// with authoritative kv fallback on miss).
+	revokedCache map[string]bool
+	onMu         sync.RWMutex
+	onConn       func(bool)
 }
 
 // Dial connects to NATS and (re)creates the AFEP stream.
-func Dial(ctx context.Context, url string) (*Bus, error) {
-	nc, err := nats.Connect(url,
+func Dial(ctx context.Context, url string, extra ...nats.Option) (*Bus, error) {
+	var b *Bus
+	nc, err := nats.Connect(url, append([]nats.Option{
 		nats.Name("afep"),
 		// Explicit reconnect policy + observability: a federation daemon
 		// must survive broker restarts loudly, never silently.
 		nats.MaxReconnects(-1),
-		nats.ReconnectWait(2*time.Second),
+		nats.ReconnectWait(2 * time.Second),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			log.Printf("natsbus: disconnected: %v", err)
+			notifyConn(b, false)
 		}),
 		nats.ReconnectHandler(func(_ *nats.Conn) {
 			log.Printf("natsbus: reconnected")
+			notifyConn(b, true)
 		}),
 		nats.ClosedHandler(func(c *nats.Conn) {
 			if err := c.LastError(); err != nil {
@@ -60,8 +74,9 @@ func Dial(ctx context.Context, url string) (*Bus, error) {
 			} else {
 				log.Printf("natsbus: connection closed")
 			}
+			notifyConn(b, false)
 		}),
-	)
+	}, extra...)...)
 	if err != nil {
 		return nil, fmt.Errorf("afep/natsbus: connect: %w", err)
 	}
@@ -114,7 +129,11 @@ func Dial(ctx context.Context, url string) (*Bus, error) {
 		nc.Close()
 		return nil, fmt.Errorf("afep/natsbus: kv bucket: %w", err)
 	}
-	b := &Bus{nc: nc, js: js, kv: kv, cardCache: make(map[string][]byte)}
+	b = &Bus{
+		nc: nc, js: js, kv: kv,
+		cardCache:    make(map[string][]byte),
+		revokedCache: make(map[string]bool),
+	}
 	b.startCardWatcher(ctx)
 	return b, nil
 }
@@ -168,15 +187,27 @@ func (b *Bus) startCardWatcher(ctx context.Context) {
 					continue // end of the initial snapshot
 				}
 				key := entry.Key()
+				revoked := strings.HasPrefix(key, RevokedPrefix)
+				if revoked {
+					key = strings.TrimPrefix(key, RevokedPrefix)
+				}
 				if entry.Operation() == jetstream.KeyValueDelete ||
 					entry.Operation() == jetstream.KeyValuePurge {
 					b.kvL.Lock()
-					delete(b.cardCache, key)
+					if revoked {
+						delete(b.revokedCache, key)
+					} else {
+						delete(b.cardCache, key)
+					}
 					b.kvL.Unlock()
 					continue
 				}
 				b.kvL.Lock()
-				b.cardCache[key] = append([]byte(nil), entry.Value()...)
+				if revoked {
+					b.revokedCache[key] = true
+				} else {
+					b.cardCache[key] = append([]byte(nil), entry.Value()...)
+				}
 				b.kvL.Unlock()
 			}
 			if wctx.Err() != nil {
@@ -184,6 +215,89 @@ func (b *Bus) startCardWatcher(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// AuthOptionsFromEnv builds NATS auth/TLS options from the environment
+// (secrets stay out of argv and out of chat): AFEP_NATS_TOKEN,
+// AFEP_NATS_USER + AFEP_NATS_PASS, AFEP_NATS_CREDS (signed .creds file),
+// AFEP_NATS_TLSCA (PEM that signs the broker certificate).
+func AuthOptionsFromEnv() ([]nats.Option, error) {
+	var opts []nats.Option
+	if tok := os.Getenv("AFEP_NATS_TOKEN"); tok != "" {
+		opts = append(opts, nats.Token(tok))
+	}
+	user, pass := os.Getenv("AFEP_NATS_USER"), os.Getenv("AFEP_NATS_PASS")
+	if user != "" && pass != "" {
+		opts = append(opts, nats.UserInfo(user, pass))
+	}
+	if creds := os.Getenv("AFEP_NATS_CREDS"); creds != "" {
+		opts = append(opts, nats.UserCredentials(creds))
+	}
+	if ca := os.Getenv("AFEP_NATS_TLSCA"); ca != "" {
+		opts = append(opts, nats.RootCAs(ca))
+	}
+	return opts, nil
+}
+
+// NotifyConnChanges reports mesh connectivity transitions (true = connected).
+// Readiness probes subscribe here so health reflects the broker, not just
+// the process.
+func (b *Bus) NotifyConnChanges(f func(bool)) {
+	b.onMu.Lock()
+	b.onConn = f
+	b.onMu.Unlock()
+}
+
+func notifyConn(b *Bus, up bool) {
+	if b == nil {
+		return
+	}
+	b.onMu.RLock()
+	f := b.onConn
+	b.onMu.RUnlock()
+	if f != nil {
+		f(up)
+	}
+}
+
+// RevokeCard marks a card id as revoked (kv "revoked/<id>"); the watcher
+// mirrors it so verifiers see it with zero RTT.
+func (b *Bus) RevokeCard(ctx context.Context, id string) error {
+	if b.kv == nil {
+		return errors.New("afep/natsbus: kv not initialized")
+	}
+	if _, err := b.kv.Put(ctx, RevokedPrefix+id, []byte(time.Now().UTC().Format(time.RFC3339))); err != nil {
+		return fmt.Errorf("afep/natsbus: revoke: %w", err)
+	}
+	b.kvL.Lock()
+	b.revokedCache[id] = true
+	b.kvL.Unlock()
+	return nil
+}
+
+// IsRevoked reports whether a card id was revoked: mirror first, then an
+// authoritative kv read (fail closed on kv errors when the caller treats
+// err != nil as transient).
+func (b *Bus) IsRevoked(ctx context.Context, id string) (bool, error) {
+	if b.kv == nil {
+		return false, errors.New("afep/natsbus: kv not initialized")
+	}
+	b.kvL.RLock()
+	rev := b.revokedCache[id]
+	b.kvL.RUnlock()
+	if rev {
+		return true, nil
+	}
+	if _, err := b.kv.Get(ctx, RevokedPrefix+id); err == nil {
+		b.kvL.Lock()
+		b.revokedCache[id] = true
+		b.kvL.Unlock()
+		return true, nil
+	} else if err == jetstream.ErrKeyNotFound {
+		return false, nil
+	} else {
+		return false, fmt.Errorf("afep/natsbus: revocation lookup: %w", err)
+	}
 }
 
 // LogStatsEvery logs stream and consumer counters: pending lag and
@@ -311,19 +425,23 @@ func (b *Bus) SubscribeEnvelopes(ctx context.Context, domain, durable string, h 
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("natsbus: handler panic (term): %v\n%s", r, debug.Stack())
+				metrics.EnvelopePanic.Inc()
 				_ = msg.Term()
 			}
 		}()
 		env := &afepv1.TaskEnvelope{}
 		if err := proto.Unmarshal(msg.Data(), env); err != nil {
+			metrics.EnvelopeTerm.Inc()
 			_ = msg.Term() // poison message: stop redelivering it
 			return
 		}
 		_ = msg.InProgress() // extend the ack window across handler execution
 		if err := h(env); err != nil {
 			if errors.Is(err, ErrTerm) {
+				metrics.EnvelopeTerm.Inc()
 				_ = msg.Term()
 			} else {
+				metrics.EnvelopeNak.Inc()
 				// Backoff instead of a hot redelivery loop: MaxDeliver=5
 				// bounds attempts, the delay spreads them out.
 				delay := 2 * time.Second
@@ -334,6 +452,7 @@ func (b *Bus) SubscribeEnvelopes(ctx context.Context, domain, durable string, h 
 			}
 			return
 		}
+		metrics.EnvelopeAck.Inc()
 		_ = msg.Ack()
 	})
 	if err != nil {
@@ -403,6 +522,7 @@ func (b *Bus) PublishBid(domain, agent string, bid *afepv1.Bid) error {
 	if err := b.nc.PublishMsg(msg); err != nil {
 		return fmt.Errorf("afep/natsbus: publish bid: %w", err)
 	}
+	metrics.BidPublished.Inc()
 	// Best-effort JetStream archive (live path above is the contract):
 	// same payload + MsgId, so replays stay idempotent per task+agent.
 	actx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -410,6 +530,7 @@ func (b *Bus) PublishBid(domain, agent string, bid *afepv1.Bid) error {
 	am := &nats.Msg{Subject: subject, Data: body, Header: make(nats.Header)}
 	am.Header.Set(nats.MsgIdHdr, bid.GetTaskId()+":"+bid.GetAgentId())
 	if _, err := b.js.PublishMsg(actx, am); err != nil {
+		metrics.BidArchiveFailed.Inc()
 		log.Printf("natsbus: bid archive: %v", err) // non-fatal
 	}
 	return nil

@@ -22,12 +22,14 @@ import (
 	natsbus "github.com/mrschneider/afep/internal/bus/nats"
 	"github.com/mrschneider/afep/internal/identity"
 	"github.com/mrschneider/afep/internal/mesh"
+	"github.com/mrschneider/afep/internal/metrics"
 	"github.com/mrschneider/afep/internal/quictransport"
 	"github.com/mrschneider/afep/internal/registry"
 	"github.com/mrschneider/afep/internal/router"
 	"github.com/mrschneider/afep/internal/taskstore"
 	"github.com/mrschneider/afep/internal/transport/grpcsvc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
@@ -47,7 +49,67 @@ func main() {
 	peers := flag.String("peers", "", "comma-separated peer domains for cross-domain escalation")
 	pruneAge := flag.Duration("prune-age", 24*time.Hour, "prune terminal tasks older than this (0 disables)")
 	maxTasks := flag.Uint("max-tasks", 100000, "hard cap on stored tasks (0 = unlimited)")
+	grpcRate := flag.Float64("grpc-rate", 200, "gRPC ingress requests/messages per second (0 disables)")
+	revokeCard := flag.String("revoke-card", "", "revoke an issuer card id in the KV bucket and exit")
+	quicProbe := flag.String("quic-probe", "", "dial this gRPC-over-QUIC address, health-check it and exit")
+	quicCA := flag.String("quic-ca", "", "PEM certificate to pin for -quic-probe (default: dev skip-verify)")
 	flag.Parse()
+
+	if *revokeCard != "" {
+		authOpts, oerr := natsbus.AuthOptionsFromEnv()
+		if oerr != nil {
+			log.Fatalf("nats auth: %v", oerr)
+		}
+		rctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		b, derr := natsbus.Dial(rctx, *natsURL, authOpts...)
+		if derr != nil {
+			log.Fatalf("nats: %v", derr)
+		}
+		defer b.Close()
+		if err := b.RevokeCard(rctx, *revokeCard); err != nil {
+			log.Fatalf("revoke: %v", err)
+		}
+		log.Printf("revoked card %s (kv %s%s)", *revokeCard, natsbus.RevokedPrefix, *revokeCard)
+		return
+	}
+
+	if *quicProbe != "" {
+		host, _, err := net.SplitHostPort(*quicProbe)
+		if err != nil {
+			log.Fatalf("quic-probe address: %v", err)
+		}
+		conf := quictransport.ClientTLS()
+		if *quicCA != "" {
+			conf, err = quictransport.ClientTLSFromCA(*quicCA, host)
+			if err != nil {
+				log.Fatalf("quic-probe ca: %v", err)
+			}
+		}
+		pctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		conn, err := quictransport.DialWithTLS(pctx, *quicProbe, conf)
+		if err != nil {
+			log.Fatalf("quic-probe: %v", err)
+		}
+		defer conn.Close()
+		cc, err := grpc.NewClient(*quicProbe,
+			grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return conn, nil }),
+			grpc.WithTransportCredentials(insecure.NewCredentials()), // TLS is QUICs layer
+		)
+		if err != nil {
+			log.Fatalf("quic-probe client: %v", err)
+		}
+		resp, err := healthpb.NewHealthClient(cc).Check(pctx, &healthpb.HealthCheckRequest{})
+		if err != nil {
+			log.Fatalf("quic-probe health: %v", err)
+		}
+		log.Printf("quic-probe %s: %s", *quicProbe, resp.GetStatus())
+		if resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+			os.Exit(1)
+		}
+		return
+	}
 
 	kp, err := loadOrCreateKey(*keyPath)
 	if err != nil {
@@ -97,16 +159,50 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Health probes get a real signal (mesh status flips on connection
+	// events); recovery interceptors turn handler panics into
+	// codes.Internal instead of killing the daemon; the limiter bounds
+	// ingress work before signatures are verified.
+	healthSrv := health.NewServer()
+	healthSrv.SetServingStatus("afep.mesh", healthpb.HealthCheckResponse_NOT_SERVING)
+	serverOpts := []grpc.ServerOption{
+		grpc.ChainUnaryInterceptor(grpcsvc.RecoveryUnary),
+		grpc.ChainStreamInterceptor(grpcsvc.RecoveryStream),
+	}
+	if *grpcRate > 0 {
+		lim := grpcsvc.NewLimiter(*grpcRate, *grpcRate*2)
+		serverOpts = append(serverOpts,
+			grpc.ChainUnaryInterceptor(lim.Unary()),
+			grpc.ChainStreamInterceptor(lim.Stream()),
+		)
+	}
+
 	// --- optional mesh -------------------------------------------------
 	var bus *natsbus.Bus
 	if *natsURL != "" {
-		b, err := natsbus.Dial(ctx, *natsURL)
+		authOpts, oerr := natsbus.AuthOptionsFromEnv()
+		if oerr != nil {
+			log.Fatalf("nats auth: %v", oerr)
+		}
+		b, err := natsbus.Dial(ctx, *natsURL, authOpts...)
 		if err != nil {
 			log.Printf("nats: mesh disabled (%v)", err)
 		} else {
 			bus = b
 			defer bus.Close()
 			bus.LogStatsEvery(ctx, 5*time.Minute) // pending/redeliveries visibility
+			// Readiness follows the broker: SERVING now, then flipped by
+			// the connection handlers.
+			healthSrv.SetServingStatus("afep.mesh", healthpb.HealthCheckResponse_SERVING)
+			bus.NotifyConnChanges(func(up bool) {
+				st := healthpb.HealthCheckResponse_NOT_SERVING
+				if up {
+					st = healthpb.HealthCheckResponse_SERVING
+				}
+				healthSrv.SetServingStatus("afep.mesh", st)
+			})
+			// Issuer revocation on both ingress paths (kv-backed).
+			svc.SetRevocations(bus.IsRevoked)
 			if err := bus.PutCard(ctx, self); err != nil {
 				log.Printf("nats: card publish: %v", err)
 			}
@@ -120,7 +216,8 @@ func main() {
 			handler, err := mesh.New(mesh.Config{
 				Domain: *domain, Self: self, Key: kp, Score: *bidScore,
 				Router: rt, Bids: bus, Relay: bus,
-				Issuers: mesh.CardResolverFunc(bus.GetCard),
+				Issuers:     mesh.CardResolverFunc(bus.GetCard),
+				Revocations: bus,
 			})
 			if err != nil {
 				log.Fatalf("mesh: %v", err)
@@ -150,18 +247,12 @@ func main() {
 
 	// --- gRPC over TCP -------------------------------------------------
 	servers := []*grpc.Server{}
-	// Health probes get a real signal; recovery interceptors turn handler
-	// panics into codes.Internal instead of killing the daemon.
-	healthSrv := health.NewServer()
 
 	tcpLn, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatalf("listen %s: %v", *listen, err)
 	}
-	tcpSrv := grpc.NewServer(
-		grpc.ChainUnaryInterceptor(grpcsvc.RecoveryUnary),
-		grpc.ChainStreamInterceptor(grpcsvc.RecoveryStream),
-	)
+	tcpSrv := grpc.NewServer(serverOpts...)
 	afepv1.RegisterAgentTransportServiceServer(tcpSrv, svc)
 	healthpb.RegisterHealthServer(tcpSrv, healthSrv)
 	servers = append(servers, tcpSrv)
@@ -182,10 +273,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("quic listen: %v", err)
 		}
-		qSrv := grpc.NewServer(
-			grpc.ChainUnaryInterceptor(grpcsvc.RecoveryUnary),
-			grpc.ChainStreamInterceptor(grpcsvc.RecoveryStream),
-		)
+		qSrv := grpc.NewServer(serverOpts...)
 		afepv1.RegisterAgentTransportServiceServer(qSrv, svc)
 		healthpb.RegisterHealthServer(qSrv, healthSrv)
 		servers = append(servers, qSrv)
@@ -205,6 +293,10 @@ func main() {
 		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok"))
+		})
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+			metrics.Render(w)
 		})
 		httpSrv = &http.Server{Addr: *httpListen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 		go func() {

@@ -14,6 +14,7 @@ import (
 	"github.com/mrschneider/afep/internal/clearance"
 	"github.com/mrschneider/afep/internal/identity"
 	"github.com/mrschneider/afep/internal/lifecycle"
+	"github.com/mrschneider/afep/internal/metrics"
 	"github.com/mrschneider/afep/internal/registry"
 	"github.com/mrschneider/afep/internal/schemareg"
 	"github.com/mrschneider/afep/internal/taskstore"
@@ -37,6 +38,10 @@ type Server struct {
 	store   *taskstore.Store
 	score   uint64
 
+	// revocations (optional, wired after the bus connects) rejects
+	// envelopes whose issuer card was revoked.
+	revocations func(context.Context, string) (bool, error)
+
 	mu    sync.RWMutex
 	tasks map[string]*afepv1.TaskEnvelope
 }
@@ -52,6 +57,12 @@ func WithBidScore(n uint64) Option {
 // WithSchemaRegistry replaces the payload validation registry.
 func WithSchemaRegistry(r *schemareg.Registry) Option {
 	return func(s *Server) { s.schemas = r }
+}
+
+// SetRevocations wires the issuer-card revocation check; call it after
+// the mesh bus connects (the service is built before the bus).
+func (s *Server) SetRevocations(f func(context.Context, string) (bool, error)) {
+	s.revocations = f
 }
 
 // WithTaskStore persists state transitions across restarts.
@@ -206,7 +217,7 @@ func (s *Server) TaskStream(stream afepv1.AgentTransportService_TaskStreamServer
 			if err := s.schemas.ValidateEnvelope(env); err != nil {
 				return status.Error(codes.InvalidArgument, err.Error())
 			}
-			if err := s.verifyIngressEnvelope(env); err != nil {
+			if err := s.verifyIngressEnvelope(stream.Context(), env); err != nil {
 				return err
 			}
 			if env.GetTaskId() == "" {
@@ -244,7 +255,7 @@ func (s *Server) TaskStream(stream afepv1.AgentTransportService_TaskStreamServer
 // verifyIngressEnvelope enforces issuer signatures on envelopes entering
 // via TaskStream: the issuer must be this node or a locally registered
 // card, and its key must verify the signed core.
-func (s *Server) verifyIngressEnvelope(env *afepv1.TaskEnvelope) error {
+func (s *Server) verifyIngressEnvelope(ctx context.Context, env *afepv1.TaskEnvelope) error {
 	issuer := env.GetIssuerAgent()
 	if issuer == "" {
 		return status.Error(codes.InvalidArgument, "envelope has no issuer")
@@ -258,6 +269,16 @@ func (s *Server) verifyIngressEnvelope(env *afepv1.TaskEnvelope) error {
 			return status.Errorf(codes.NotFound, "issuer %q not registered", issuer)
 		}
 		card = c
+	}
+	if s.revocations != nil {
+		revoked, rerr := s.revocations(ctx, issuer)
+		if rerr != nil {
+			return status.Errorf(codes.Unavailable, "revocation lookup: %v", rerr)
+		}
+		if revoked {
+			metrics.RevokedRejected.Inc()
+			return status.Error(codes.PermissionDenied, "issuer card is revoked")
+		}
 	}
 	if err := identity.VerifyEnvelope(env, card); err != nil {
 		return status.Error(codes.PermissionDenied, "issuer signature: "+err.Error())

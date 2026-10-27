@@ -1,4 +1,4 @@
-.PHONY: all fmt lint test build gen nats-up nats-down demo
+.PHONY: all fmt lint test build gen nats-up nats-down demo fuzz bench conformance
 
 all: lint test build
 
@@ -17,6 +17,17 @@ python-test:
 
 build:
 	go build -o bin/afepd ./cmd/afepd
+
+fuzz:
+	go test -run='^$$' -fuzz=FuzzParseSubject -fuzztime=10s ./internal/bus/nats/
+	go test -run='^$$' -fuzz=FuzzTaskstoreOpen -fuzztime=10s ./internal/taskstore/
+	go test -run='^$$' -fuzz=FuzzEnvelopeBytes -fuzztime=10s ./internal/identity/
+
+bench:
+	go test -run='^$$' -bench=. -benchtime=100x ./internal/identity/ ./internal/mesh/ ./internal/taskstore/
+
+conformance:
+	cd python && PYTHONPATH=. .venv/bin/python ../conformance/verify.py
 
 gen:
 	buf generate

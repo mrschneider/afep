@@ -2,6 +2,7 @@ package quictransport
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"time"
@@ -12,7 +13,13 @@ import (
 // Dial opens a QUIC connection to addr and returns the first bidirectional
 // stream as a net.Conn — the client side of one gRPC connection.
 func Dial(ctx context.Context, addr string) (net.Conn, error) {
-	conn, err := quic.DialAddr(ctx, addr, ClientTLS(), &quic.Config{
+	return DialWithTLS(ctx, addr, ClientTLS())
+}
+
+// DialWithTLS dials addr with an explicit client TLS config (use
+// ClientTLSFromCA to pin instead of the dev skip-verify default).
+func DialWithTLS(ctx context.Context, addr string, conf *tls.Config) (net.Conn, error) {
+	conn, err := quic.DialAddr(ctx, addr, conf, &quic.Config{
 		KeepAlivePeriod: 15 * time.Second,
 		MaxIdleTimeout:  60 * time.Second,
 	})
