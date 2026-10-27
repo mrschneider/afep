@@ -269,7 +269,9 @@ func (s *Server) verifyIngressEnvelope(env *afepv1.TaskEnvelope) error {
 // the durable task store.
 func (s *Server) save(env *afepv1.TaskEnvelope) error {
 	s.mu.Lock()
-	s.tasks[env.GetTaskId()] = env
+	// server-owned copy: RPC request objects must never alias the
+	// map (the store clones again at its own boundary in Put).
+	s.tasks[env.GetTaskId()] = proto.Clone(env).(*afepv1.TaskEnvelope)
 	s.mu.Unlock()
 	if s.store != nil {
 		return s.store.Put(env)
@@ -281,7 +283,12 @@ func (s *Server) load(id string) (*afepv1.TaskEnvelope, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	env, ok := s.tasks[id]
-	return env, ok
+	if !ok {
+		return nil, false
+	}
+	// callers own the value: Commit mutates the result in place, so it
+	// must be a private copy or it races concurrent saves/flushes.
+	return proto.Clone(env).(*afepv1.TaskEnvelope), true
 }
 
 func hasCapability(card *afepv1.AgentCard, name string) bool {

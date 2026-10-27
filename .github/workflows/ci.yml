@@ -43,7 +43,7 @@ jobs:
         run: |
           go build -o bin/afepd ./cmd/afepd
           ./bin/afepd -h
-      - run: go test ./...
+      - run: go test -race -count=1 ./...
 
   python:
     runs-on: ubuntu-latest

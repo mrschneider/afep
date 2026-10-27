@@ -28,6 +28,8 @@ import (
 	"github.com/mrschneider/afep/internal/taskstore"
 	"github.com/mrschneider/afep/internal/transport/grpcsvc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 func main() {
@@ -44,6 +46,7 @@ func main() {
 	bidScore := flag.Uint64("bid-score", 100, "score stamped on this node's bids")
 	peers := flag.String("peers", "", "comma-separated peer domains for cross-domain escalation")
 	pruneAge := flag.Duration("prune-age", 24*time.Hour, "prune terminal tasks older than this (0 disables)")
+	maxTasks := flag.Uint("max-tasks", 100000, "hard cap on stored tasks (0 = unlimited)")
 	flag.Parse()
 
 	kp, err := loadOrCreateKey(*keyPath)
@@ -76,6 +79,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("taskstore: %v", err)
 	}
+	store.SetMaxTasks(int(*maxTasks))
 	if *pruneAge > 0 {
 		if n, err := store.PruneTerminal(*pruneAge, time.Now()); err != nil {
 			log.Printf("taskstore prune: %v", err)
@@ -122,7 +126,11 @@ func main() {
 			}
 			durable := "afepd-" + sanitize(*agentID)
 			if _, err := bus.SubscribeEnvelopes(ctx, *domain, durable, func(env *afepv1.TaskEnvelope) error {
-				if err := handler.OnEnvelope(ctx, env); err != nil {
+				// Per-message deadline: the subscribe ctx has no timeout, so a
+				// wedged publish could block the consumer loop forever.
+				hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				if err := handler.OnEnvelope(hctx, env); err != nil {
 					if errors.Is(err, mesh.ErrRejected) {
 						return natsbus.ErrTerm // poison: stop redelivering
 					}
@@ -141,13 +149,20 @@ func main() {
 
 	// --- gRPC over TCP -------------------------------------------------
 	servers := []*grpc.Server{}
+	// Health probes get a real signal; recovery interceptors turn handler
+	// panics into codes.Internal instead of killing the daemon.
+	healthSrv := health.NewServer()
 
 	tcpLn, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatalf("listen %s: %v", *listen, err)
 	}
-	tcpSrv := grpc.NewServer()
+	tcpSrv := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(grpcsvc.RecoveryUnary),
+		grpc.ChainStreamInterceptor(grpcsvc.RecoveryStream),
+	)
 	afepv1.RegisterAgentTransportServiceServer(tcpSrv, svc)
+	healthpb.RegisterHealthServer(tcpSrv, healthSrv)
 	servers = append(servers, tcpSrv)
 	go func() {
 		if err := tcpSrv.Serve(tcpLn); err != nil {
@@ -158,12 +173,20 @@ func main() {
 
 	// --- gRPC over QUIC (optional) ------------------------------------
 	if *listenQUIC != "" {
-		qln, err := quictransport.Listen(*listenQUIC)
+		cert, err := quictransport.LoadOrCreateCert(*keyPath+".quic.crt", *keyPath+".quic.key")
+		if err != nil {
+			log.Fatalf("quic cert: %v", err)
+		}
+		qln, err := quictransport.ListenTLS(*listenQUIC, quictransport.ServerTLS(cert))
 		if err != nil {
 			log.Fatalf("quic listen: %v", err)
 		}
-		qSrv := grpc.NewServer()
+		qSrv := grpc.NewServer(
+			grpc.ChainUnaryInterceptor(grpcsvc.RecoveryUnary),
+			grpc.ChainStreamInterceptor(grpcsvc.RecoveryStream),
+		)
 		afepv1.RegisterAgentTransportServiceServer(qSrv, svc)
+		healthpb.RegisterHealthServer(qSrv, healthSrv)
 		servers = append(servers, qSrv)
 		go func() {
 			if err := qSrv.Serve(qln); err != nil {
@@ -198,6 +221,7 @@ func main() {
 
 	<-ctx.Done()
 	log.Print("afepd: shutting down")
+	healthSrv.Shutdown() // flips probes to NOT_SERVING before stop
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if httpSrv != nil {

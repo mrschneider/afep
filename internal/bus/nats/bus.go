@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"runtime/debug"
 	"strconv"
 	"time"
 
@@ -27,7 +29,26 @@ type Bus struct {
 
 // Dial connects to NATS and (re)creates the AFEP stream.
 func Dial(ctx context.Context, url string) (*Bus, error) {
-	nc, err := nats.Connect(url, nats.Name("afep"))
+	nc, err := nats.Connect(url,
+		nats.Name("afep"),
+		// Explicit reconnect policy + observability: a federation daemon
+		// must survive broker restarts loudly, never silently.
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(2*time.Second),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			log.Printf("natsbus: disconnected: %v", err)
+		}),
+		nats.ReconnectHandler(func(_ *nats.Conn) {
+			log.Printf("natsbus: reconnected")
+		}),
+		nats.ClosedHandler(func(c *nats.Conn) {
+			if err := c.LastError(); err != nil {
+				log.Printf("natsbus: connection closed: %v", err)
+			} else {
+				log.Printf("natsbus: connection closed")
+			}
+		}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("afep/natsbus: connect: %w", err)
 	}
@@ -42,6 +63,8 @@ func Dial(ctx context.Context, url string) (*Bus, error) {
 		Storage:    jetstream.FileStorage,
 		Retention:  jetstream.LimitsPolicy,
 		MaxAge:     24 * time.Hour,
+		MaxBytes:   1 << 30, // 1 GiB cap: an inundation must not fill the disk
+		Discard:    jetstream.DiscardOld,
 		Duplicates: 2 * time.Minute,
 	})
 	if err != nil {
@@ -53,7 +76,20 @@ func Dial(ctx context.Context, url string) (*Bus, error) {
 
 // Close tears down the NATS connection.
 func (b *Bus) Close() {
-	if b.nc != nil {
+	if b.nc == nil {
+		return
+	}
+	// Drain flushes buffered publishes and unsubscribes consumers so a
+	// shutdown does not drop messages already handed to the client;
+	// bounded so a wedged connection cannot hang the daemon.
+	done := make(chan struct{})
+	go func() {
+		_ = b.nc.Drain()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
 		b.nc.Close()
 	}
 }
@@ -90,6 +126,21 @@ func (b *Bus) PublishEnvelope(ctx context.Context, domain, agent string, env *af
 // is discarded instead of redelivered forever.
 var ErrTerm = errors.New("afep/natsbus: term")
 
+// redeliveryDelay spreads out NAK retries (1s, 2s, 4s, ... capped 30s).
+func redeliveryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > 6 {
+		return 30 * time.Second
+	}
+	d := time.Second << (attempt - 1)
+	if d > 30*time.Second {
+		return 30 * time.Second
+	}
+	return d
+}
+
 // EnvelopeHandler returns nil to ack the message or an error to redeliver.
 type EnvelopeHandler func(*afepv1.TaskEnvelope) error
 
@@ -110,6 +161,14 @@ func (b *Bus) SubscribeEnvelopes(ctx context.Context, domain, durable string, h 
 		return nil, fmt.Errorf("afep/natsbus: consumer: %w", err)
 	}
 	cc, err := cons.Consume(func(msg jetstream.Msg) {
+		// A handler panic must not take the whole daemon down: term the
+		// message, log the stack, keep the consumer alive.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("natsbus: handler panic (term): %v\n%s", r, debug.Stack())
+				_ = msg.Term()
+			}
+		}()
 		env := &afepv1.TaskEnvelope{}
 		if err := proto.Unmarshal(msg.Data(), env); err != nil {
 			_ = msg.Term() // poison message: stop redelivering it
@@ -119,7 +178,13 @@ func (b *Bus) SubscribeEnvelopes(ctx context.Context, domain, durable string, h 
 			if errors.Is(err, ErrTerm) {
 				_ = msg.Term()
 			} else {
-				_ = msg.Nak()
+				// Backoff instead of a hot redelivery loop: MaxDeliver=5
+				// bounds attempts, the delay spreads them out.
+				delay := 2 * time.Second
+				if meta, err := msg.Metadata(); err == nil {
+					delay = redeliveryDelay(int(meta.NumDelivered))
+				}
+				_ = msg.NakWithDelay(delay)
 			}
 			return
 		}

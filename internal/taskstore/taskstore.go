@@ -13,6 +13,7 @@ import (
 
 	afepv1 "github.com/mrschneider/afep/gen/go/afep/v1"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 const version = 1
@@ -27,11 +28,21 @@ type Store struct {
 	mu    sync.RWMutex
 	path  string
 	tasks map[string]*afepv1.TaskEnvelope
+	// raws caches the protojson encoding of each stored envelope so a
+	// flush re-serializes only the task that changed, never all of them.
+	raws map[string]json.RawMessage
+	// maxTasks caps stored envelopes (0 = unlimited): prune-age=0
+	// used to leave the store without any bound at all.
+	maxTasks int
 }
 
 // Open loads the store from path; a missing file starts fresh.
 func Open(path string) (*Store, error) {
-	s := &Store{path: path, tasks: make(map[string]*afepv1.TaskEnvelope)}
+	s := &Store{
+		path:  path,
+		tasks: make(map[string]*afepv1.TaskEnvelope),
+		raws:  make(map[string]json.RawMessage),
+	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
@@ -53,6 +64,7 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("afep/taskstore: task %s: %w", id, err)
 		}
 		s.tasks[id] = env
+		s.raws[id] = raw // byte-preserved: no re-encode at boot
 	}
 	return s, nil
 }
@@ -64,7 +76,22 @@ func (s *Store) Put(env *afepv1.TaskEnvelope) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tasks[env.GetTaskId()] = env
+	id := env.GetTaskId()
+	if _, exists := s.tasks[id]; !exists && s.maxTasks > 0 && len(s.tasks) >= s.maxTasks {
+		return fmt.Errorf("afep/taskstore: task limit %d reached", s.maxTasks)
+	}
+	// Store-owned copy: callers may keep mutating their envelope while
+	// flushes read ours — one clone keeps memory, the raws cache and the
+	// file in lockstep (and kills the Probe/Commit aliasing race).
+	owned := proto.Clone(env).(*afepv1.TaskEnvelope)
+	// protojson runs once here for THIS envelope; flushes below emit
+	// the cached bytes instead of re-encoding every stored task.
+	raw, err := (protojson.MarshalOptions{}).Marshal(owned)
+	if err != nil {
+		return fmt.Errorf("afep/taskstore: marshal %s: %w", id, err)
+	}
+	s.tasks[id] = owned
+	s.raws[id] = raw
 	return s.flushLocked()
 }
 
@@ -73,7 +100,12 @@ func (s *Store) Get(id string) (*afepv1.TaskEnvelope, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	env, ok := s.tasks[id]
-	return env, ok
+	if !ok {
+		return nil, false
+	}
+	// The doc promises callers own the value: hand out a copy so a
+	// mutation never aliases the store (or its raws cache).
+	return proto.Clone(env).(*afepv1.TaskEnvelope), true
 }
 
 // Len reports how many tasks are stored.
@@ -81,6 +113,13 @@ func (s *Store) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.tasks)
+}
+
+// SetMaxTasks caps how many envelopes the store accepts (0 = unlimited).
+func (s *Store) SetMaxTasks(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.maxTasks = n
 }
 
 // PruneTerminal drops DONE/FAILED envelopes older than maxAge (by
@@ -95,6 +134,7 @@ func (s *Store) PruneTerminal(maxAge time.Duration, now time.Time) (int, error) 
 		age := now.Sub(time.Unix(env.GetUpdatedAtUnix(), 0))
 		if terminal && age > maxAge {
 			delete(s.tasks, id)
+			delete(s.raws, id)
 			removed++
 		}
 	}
@@ -108,15 +148,9 @@ func (s *Store) flushLocked() error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return fmt.Errorf("afep/taskstore: mkdir: %w", err)
 	}
-	st := diskState{Version: version, Tasks: make(map[string]json.RawMessage, len(s.tasks))}
-	marshal := protojson.MarshalOptions{}
-	for id, env := range s.tasks {
-		raw, err := marshal.Marshal(env)
-		if err != nil {
-			return fmt.Errorf("afep/taskstore: marshal %s: %w", id, err)
-		}
-		st.Tasks[id] = raw
-	}
+	// Same full-state snapshot semantics; the per-task protojson cost
+	// was O(all tasks) per Put and now lives only in Put itself.
+	st := diskState{Version: version, Tasks: s.raws}
 	data, err := json.Marshal(st)
 	if err != nil {
 		return fmt.Errorf("afep/taskstore: encode: %w", err)
@@ -140,6 +174,19 @@ func (s *Store) flushLocked() error {
 	}
 	if err := os.Rename(tmpName, s.path); err != nil {
 		return fmt.Errorf("afep/taskstore: rename: %w", err)
+	}
+	// fsync the directory entry: without it the rename itself can be
+	// lost on crash, resurrecting the previous snapshot.
+	d, err := os.Open(filepath.Dir(s.path))
+	if err != nil {
+		return fmt.Errorf("afep/taskstore: open dir: %w", err)
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return fmt.Errorf("afep/taskstore: sync dir: %w", err)
+	}
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("afep/taskstore: close dir: %w", err)
 	}
 	return nil
 }

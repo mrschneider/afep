@@ -13,9 +13,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"math/big"
 	"net"
+	"os"
 	"time"
 )
 
@@ -26,13 +28,23 @@ const ALPN = "afep-quic/0.1"
 // loopback SANs, valid one year). Production deployments should pin a CA
 // instead of skipping verification on the client side.
 func SelfSigned() (tls.Certificate, error) {
+	der, key, err := selfSignedMaterial()
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
+}
+
+// selfSignedMaterial builds the dev certificate DER + key (shared by
+// SelfSigned and the persistent loader).
+func selfSignedMaterial() ([]byte, *ecdsa.PrivateKey, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("afep/quic: keygen: %w", err)
+		return nil, nil, fmt.Errorf("afep/quic: keygen: %w", err)
 	}
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("afep/quic: serial: %w", err)
+		return nil, nil, fmt.Errorf("afep/quic: serial: %w", err)
 	}
 	tmpl := x509.Certificate{
 		SerialNumber: serial,
@@ -46,9 +58,42 @@ func SelfSigned() (tls.Certificate, error) {
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("afep/quic: cert: %w", err)
+		return nil, nil, fmt.Errorf("afep/quic: cert: %w", err)
 	}
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
+	return der, key, nil
+}
+
+// LoadOrCreateCert persists the QUIC server certificate next to the
+// identity seed: load the pair when present (stable federation identity
+// across restarts — ephemeral certs changed the fingerprint on every
+// boot), otherwise generate and write it (key 0600).
+func LoadOrCreateCert(certFile, keyFile string) (tls.Certificate, error) {
+	certPEM, errC := os.ReadFile(certFile)
+	keyPEM, errK := os.ReadFile(keyFile)
+	if errC == nil && errK == nil {
+		cert, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			return tls.Certificate{}, fmt.Errorf("afep/quic: load cert pair: %w", err)
+		}
+		return cert, nil
+	}
+	der, key, err := selfSignedMaterial()
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("afep/quic: marshal key: %w", err)
+	}
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
+		return tls.Certificate{}, fmt.Errorf("afep/quic: write key: %w", err)
+	}
+	if err := os.WriteFile(certFile, certPEM, 0o644); err != nil {
+		return tls.Certificate{}, fmt.Errorf("afep/quic: write cert: %w", err)
+	}
+	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
 // ServerTLS builds the listener-side TLS config (TLS 1.3 mandatory in QUIC).
