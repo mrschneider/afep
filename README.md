@@ -87,9 +87,11 @@ afep.<domain>.<agent>.<verb>     verbs: envelopes | bids | telemetry
 Stream `AFEP_TASKS` captures envelopes only (`afep.*.*.envelopes`, file
 storage, 24h, de-dup window 2min keyed by `task_id:state:hops` — hop-aware
 so escalations never collide with their probe). Bids travel as ephemeral
-core-NATS messages (`afep.<domain>.*.bids`, de-dup key `task:agent`);
-cards live in KV bucket `afep_cards`. Each site runs one durable consumer
-filtered to its domain.
+core-NATS messages (`afep.<domain>.*.bids`, de-dup key `task:agent`) with
+a best-effort `AFEP_BIDS` JetStream archive (24h) for rank reconstruction;
+cards live in KV bucket `afep_cards` behind a `WatchAll`-fed mirror
+(zero-RTT issuer checks). Each site runs one durable consumer filtered to
+its domain (tail start, server-side backoff, 60s ack window).
 
 ## Repo layout
 
@@ -119,6 +121,6 @@ docs/ARCHITECTURE.md          technical reference (incl. honest residuals)
 
 ## Status
 
-v0.4.0 — experimental. All v0.1.0 gaps are closed; the current honest
+v0.5.0 — experimental. All v0.1.0 gaps are closed; the current honest
 residuals live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 License: MIT.

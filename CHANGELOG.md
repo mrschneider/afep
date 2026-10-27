@@ -3,6 +3,38 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] - 2026-10-26
+
+### Changed
+
+- KV handle created once in `Dial` and the card bucket mirrored through
+  `WatchAll`: the per-envelope issuer check stops paying a `CreateStream`
+  metadata roundtrip plus `kv.Get` roundtrip per message (authoritative
+  read on cache miss; deletes honored).
+- Envelope consumer: `DeliverPolicy` `DeliverNew` (fresh durables no
+  longer replay the whole retained stream as new work; an existing
+  durable is recreated at the tail with a log when the immutable field
+  blocks the update), `AckWait` 60s plus `InProgress()` across handler
+  execution, server-side `BackOff` 60s..30m for silent handlers
+  (explicit failures keep the client-side `NakWithDelay`), and
+  `MaxAckPending` 100 bounding unacked work.
+
+### Added
+
+- `AFEP_BIDS` JetStream archive (24h, best-effort, `MsgId` `task:agent`):
+  ranks reconstructable after a restart while the live bid path stays
+  ephemeral core NATS.
+- Stream bounds on both streams: `MaxMsgs` (1M/500k) beside age and
+  bytes, `AllowDirect` ops reads by sequence, S2 compression.
+- JetStream observability: `LogStatsEvery` ticker (stream
+  msgs/bytes/consumers, consumer pending/ack-pending/redelivered) wired
+  into afepd — lag and redeliveries were previously invisible.
+
+### Notes
+
+- `InactiveThreshold` deliberately not set: it would delete an idle
+  durable and skip its backlog on return.
+
 ## [0.4.0] - 2026-10-26
 
 ### Changed

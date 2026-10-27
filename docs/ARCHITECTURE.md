@@ -1,6 +1,6 @@
 # AFEP Architecture
 
-Engineering reference for v0.4.0. Every number here is read from source
+Engineering reference for v0.5.0. Every number here is read from source
 (LOC via `grep -c`, test counts from `grep "func Test"` / `def test_`,
 contracts counted in `proto/afep/v1/`).
 
@@ -74,10 +74,10 @@ Python reference: **814 LOC**, **25 tests**; contracts: 4 proto files,
 
 | Package | LOC | Tests | Role |
 |---|---|---|---|
-| `cmd/afepd` | 303 | - | flags, key custody, mesh/QUIC/HTTP wiring, prune loop |
+| `cmd/afepd` | 304 | - | flags, key custody, mesh/QUIC/HTTP wiring, prune loop |
 | `internal/identity` | 462 | 16 | card/bid/envelope signing (deterministic body) |
 | `internal/transport/grpcsvc` | 732 | 11 | RPCs: signed bids, clearances, schema gate, store |
-| `internal/bus/nats` | 622 | 6 | stream/KV/bids, durable consume, Term-on-poison |
+| `internal/bus/nats` | 783 | 6 | stream/KV/bids, durable consume, Term-on-poison |
 | `internal/a2a` | 362 | 8 | A2A card derivation, state map, well-known handler |
 | `internal/mesh` | 530 | 11 | inbound policy: verify issuer, serve / escalate / drop |
 | `internal/quictransport` | 435 | 3 | QUIC listener/dialer, stream->net.Conn, TLS bootstrap |
@@ -112,8 +112,12 @@ by the interop fixtures (Go verification fails when the schema moves).
   KV directory (unknown/unverifiable -> Term), gRPC `TaskStream` from
   self/registry (InvalidArgument / NotFound / PermissionDenied).
 - **Bus** — stream `AFEP_TASKS` (subjects `afep.*.*.envelopes`, file,
-  24h, 2min dedup, key `task_id:state:hops`); KV `afep_cards` (7d TTL);
-  bids ephemeral on core NATS with key `task:agent`.
+  24h, 1 GiB/1M-msg caps, S2 compression, direct reads, 2min dedup, key
+  `task_id:state:hops`); stream `AFEP_BIDS` (24h best-effort archive,
+  256 MiB/500k); KV `afep_cards` (7d TTL) behind a `WatchAll`-fed
+  mirror (zero-RTT issuer lookups); bids live on core NATS with key
+  `task:agent`; the durable consumer starts at the tail (DeliverNew),
+  AckWait 60s, server BackOff 60s..30m, MaxAckPending 100.
 - **Task store** — JSON file (protojson), atomic replace, optional
   `PruneTerminal(maxAge)`.
 
@@ -166,5 +170,7 @@ by the interop fixtures (Go verification fails when the schema moves).
   stubs are CI-drift-checked, and the interop fixtures fail loudly when
   wire shapes diverge. Pyright reports false positives on generated pb2
   modules (runtime and CI are green).
-- **Bids have no replay**: core-NATS ephemeral delivery means a
-  collector that starts late misses bids — by design, re-probe.
+- **Bids have no replay (live path)**: core-NATS ephemeral delivery
+  means a live collector that starts late misses bids — by design,
+  re-probe; `AFEP_BIDS` keeps a 24h best-effort archive for rank
+  reconstruction and ops.
