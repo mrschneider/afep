@@ -76,7 +76,55 @@ AFEP_NATS=nats://127.0.0.1:4224 go test ./internal/bus/nats -run Integration -v
 -bid-score     score stamped on this node's bids
 -peers         comma list of peer domains for cross-domain escalation
 -prune-age     prune terminal tasks older than this (default 24h, 0 = off)
+-grpc-rate     ingress req/s limit          (default 200, 0 = off)
+-revoke-card   revoke issuer card id, then exit
+-quic-probe    dial QUIC address, health-check, then exit
+-quic-ca       PEM certificate to pin for -quic-probe (default: dev skip-verify)
 ```
+
+## NATS credentials
+
+Client credentials never go in argv — export them instead:
+`AFEP_NATS_USER`/`AFEP_NATS_PASS`, `AFEP_NATS_TOKEN`,
+`AFEP_NATS_CREDS` (signed `.creds` file), `AFEP_NATS_TLSCA`
+(broker CA PEM). The federation templates now enable user/password
+auth on both the client and leafnode ports (CHANGE_ME_* placeholders,
+validated with `nats-server -t`) — see `deploy/federation/README.md`
+for the backup and credential runbook.
+
+## Observability
+
+- `GET /healthz` and `GET /metrics` (Prometheus text exposition,
+  8 counters: acked/terminated/nacked envelopes, contained panics,
+  bids published, archive failures, revoked rejections, rate limits)
+  on `-http-listen`.
+- gRPC health service on both servers; the `afep.mesh` service tracks
+  broker connectivity through the NATS connection handlers
+  (NOT_SERVING while the mesh is down, NOT_SERVING at shutdown).
+- a 5-minute log ticker for stream msgs/bytes/consumers and consumer
+  pending/ack-pending/redelivered.
+
+## Security controls
+
+- issuer-card revocation: `-revoke-card <id>` writes KV
+  `revoked/<id>` (mirrored by WatchAll); both ingresses check it
+  BEFORE signature verification (mesh poisons, gRPC returns
+  `PermissionDenied`).
+- gRPC ingress rate limit: `-grpc-rate` token bucket (per unary RPC
+  and per stream message).
+- QUIC pinning: `-quic-ca` / `quictransport.ClientTLSFromCA` trust a
+  persisted peer certificate instead of the dev skip-verify default.
+- details and threat notes: [SECURITY.md](SECURITY.md).
+
+## Conformance and spec
+
+[docs/SPEC.md](docs/SPEC.md) is the normative protocol reference
+(subjects, lifecycle table, signed-core exclusions, dedup keys,
+ingress order). `conformance/vectors.json` byte-locks signed bodies,
+signatures and the subject/dedup formulas in BOTH languages — drift
+fails CI (`make conformance`; regenerate only with
+`conformance/generate.py` as part of a versioned release). Fuzzers
+and benchmarks: `make fuzz`, `make bench`.
 
 ## Subject scheme
 
@@ -114,13 +162,16 @@ internal/quictransport/       gRPC over QUIC (custom ALPN)
 internal/a2a/                 A2A v1.0 card + state mapping (well-known)
 pkg/client/                   multi-node probe: verify + rank
 internal/interop/             cross-language fixture verification
+internal/metrics/             Prometheus text counters (no client dep)
+conformance/                  byte-locked cross-language vectors
 python/                       Python reference SDK + interop fixtures
 deploy/federation/            two-site leafnode template
 docs/ARCHITECTURE.md          technical reference (incl. honest residuals)
+docs/SPEC.md                  normative protocol specification
 ```
 
 ## Status
 
-v0.5.0 — experimental. All v0.1.0 gaps are closed; the current honest
+v0.6.0 — experimental. All v0.1.0 gaps are closed; the current honest
 residuals live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 License: MIT.

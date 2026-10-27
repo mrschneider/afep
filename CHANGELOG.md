@@ -3,6 +3,57 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] - 2026-10-26
+
+### Added
+
+- NATS client credentials from the environment, never argv:
+  `AFEP_NATS_TOKEN`, `AFEP_NATS_USER`/`AFEP_NATS_PASS`,
+  `AFEP_NATS_CREDS`, `AFEP_NATS_TLSCA`; `Dial` accepts extra
+  `nats.Option`s.
+- Federation templates enable user/password auth on the client and
+  leafnode ports (validated with `nats-server -t`; CHANGE_ME_*
+  placeholders) plus a backup + credential runbook in
+  `deploy/federation/README.md`.
+- Issuer-card revocation: KV `revoked/<id>` mirrored by `WatchAll`,
+  checked BEFORE signature verification at mesh consume (poison) and
+  TaskStream (`PermissionDenied`); `RevokeCard`/`IsRevoked` API and the
+  `-revoke-card` flag. The live test caught `revoked:` being an invalid
+  NATS KV key — the prefix is `revoked/`.
+- gRPC ingress rate limiter (`-grpc-rate`, default 200 req/s, 0
+  disables): one token per unary RPC and per stream message.
+- QUIC certificate pinning: `ClientTLSFromCA` + `DialWithTLS`, exposed
+  through the `-quic-probe`/`-quic-ca` admin probe (health check over
+  QUIC), with unit tests.
+- gRPC health service on both servers; the `afep.mesh` service tracks
+  broker connectivity through the NATS connection handlers and flips to
+  NOT_SERVING at shutdown.
+- `/metrics` on the HTTP listener: Prometheus text exposition with 8
+  counters (acked/terminated/nacked envelopes, contained panics, bids
+  published, archive failures, revoked rejections, rate limits).
+- `docs/SPEC.md`: normative reference (subject scheme, lifecycle table,
+  signed-core exclusions, dedup keys, ingress order, conformance and
+  versioning rules).
+- Byte-locked cross-language conformance vectors
+  (`conformance/vectors.json` + `generate.py`/`verify.py` + Go and
+  Python tests): signed bodies, signatures, subject/dedup formulas and
+  the tail-exclusion rule; drift fails CI until deliberate regeneration.
+- Go fuzzers (`FuzzParseSubject`, `FuzzTaskstoreOpen`,
+  `FuzzEnvelopeBytes`) with a 10s-per-target CI smoke and `make fuzz`.
+- Benchmarks: `SignEnvelope`, `VerifyEnvelope`, `EnvelopeBody`,
+  `OnEnvelope`, `taskstore.Put` (`make bench`).
+- CI: NATS service container so `TestLiveJetstreamRound` runs against a
+  real broker remotely; `buf breaking` vs `HEAD~1` (fetch-depth 0).
+- `make fuzz` / `make bench` / `make conformance` targets.
+
+### Changed
+
+- SECURITY.md brought back to the truth: supported versions (0.5.x),
+  issuer signatures documented as required at ingress since 0.3.0, and
+  the dev defaults updated for QUIC pinning and federation auth.
+- ARCHITECTURE.md totals and table refreshed from source:
+  6,405 LOC / 17 packages / 95 Go tests / 30 Python tests.
+
 ## [0.5.0] - 2026-10-26
 
 ### Changed

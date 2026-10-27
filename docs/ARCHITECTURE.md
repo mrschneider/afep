@@ -1,6 +1,6 @@
 # AFEP Architecture
 
-Engineering reference for v0.5.0. Every number here is read from source
+Engineering reference for v0.6.0. Every number here is read from source
 (LOC via `grep -c`, test counts from `grep "func Test"` / `def test_`,
 contracts counted in `proto/afep/v1/`).
 
@@ -68,23 +68,24 @@ event.
 
 ## Packages
 
-Hand-written Go: **4,925 LOC** across 16 packages, **91 test functions**;
-Python reference: **814 LOC**, **25 tests**; contracts: 4 proto files,
+Hand-written Go: **6,405 LOC** across 17 packages, **95 test functions**;
+Python reference: **814 LOC**, **30 tests**; contracts: 4 proto files,
 209 LOC, 20 messages/enums/service blocks, 4 RPCs.
 
 | Package | LOC | Tests | Role |
 |---|---|---|---|
-| `cmd/afepd` | 304 | - | flags, key custody, mesh/QUIC/HTTP wiring, prune loop |
-| `internal/identity` | 462 | 16 | card/bid/envelope signing (deterministic body) |
-| `internal/transport/grpcsvc` | 732 | 11 | RPCs: signed bids, clearances, schema gate, store |
-| `internal/bus/nats` | 783 | 6 | stream/KV/bids, durable consume, Term-on-poison |
+| `cmd/afepd` | 396 | - | flags, key custody, mesh/QUIC/HTTP wiring, prune loop |
+| `internal/identity` | 729 | 17 | card/bid/envelope signing (deterministic body) |
+| `internal/transport/grpcsvc` | 831 | 11 | RPCs: signed bids, clearances, schema gate, store |
+| `internal/bus/nats` | 1106 | 7 | stream/KV/bids, durable consume, Term-on-poison |
 | `internal/a2a` | 362 | 8 | A2A card derivation, state map, well-known handler |
-| `internal/mesh` | 530 | 11 | inbound policy: verify issuer, serve / escalate / drop |
-| `internal/quictransport` | 435 | 3 | QUIC listener/dialer, stream->net.Conn, TLS bootstrap |
+| `internal/mesh` | 628 | 11 | inbound policy: verify issuer, serve / escalate / drop |
+| `internal/quictransport` | 536 | 5 | QUIC listener/dialer, stream->net.Conn, TLS bootstrap |
 | `internal/router` | 273 | 8 | escalation with hop budget and peer ordering |
 | `internal/interop` | 292 | 3 | fixture generation + cross-language verification |
-| `internal/taskstore` | 294 | 4 | atomic persistence + terminal pruning |
+| `internal/taskstore` | 353 | 4 | atomic persistence + terminal pruning |
 | `pkg/client` | 242 | 3 | ProbeAll: fan-out, verify, rank |
+| `internal/metrics` | 55 | - | Prometheus text counters, no client dep |
 | `internal/schemareg` | 189 | 8 | media-type registry and payload validation |
 | `internal/lifecycle` | 149 | 3 | transition table + Apply |
 | `internal/registry` | 130 | 3 | verified card directory + capability index |
