@@ -68,22 +68,22 @@ event.
 
 ## Packages
 
-Hand-written Go: **6,405 LOC** across 17 packages, **95 test functions**;
+Hand-written Go: **6,977 LOC** across 17 packages, **99 test functions**;
 Python reference: **814 LOC**, **30 tests**; contracts: 4 proto files,
 209 LOC, 20 messages/enums/service blocks, 4 RPCs.
 
 | Package | LOC | Tests | Role |
 |---|---|---|---|
-| `cmd/afepd` | 396 | - | flags, key custody, mesh/QUIC/HTTP wiring, prune loop |
-| `internal/identity` | 729 | 17 | card/bid/envelope signing (deterministic body) |
-| `internal/transport/grpcsvc` | 831 | 11 | RPCs: signed bids, clearances, schema gate, store |
-| `internal/bus/nats` | 1106 | 7 | stream/KV/bids, durable consume, Term-on-poison |
+| `cmd/afepd` | 403 | - | flags, key custody, mesh/QUIC/HTTP wiring, prune loop |
+| `internal/identity` | 788 | 17 | card/bid/envelope signing (deterministic body), card-verify cache |
+| `internal/transport/grpcsvc` | 838 | 11 | RPCs: signed bids, clearances, schema gate, store |
+| `internal/bus/nats` | 1153 | 7 | stream/KV/bids, durable consume, Term-on-poison, async bid archive |
 | `internal/a2a` | 362 | 8 | A2A card derivation, state map, well-known handler |
 | `internal/mesh` | 628 | 11 | inbound policy: verify issuer, serve / escalate / drop |
-| `internal/quictransport` | 536 | 5 | QUIC listener/dialer, stream->net.Conn, TLS bootstrap |
+| `internal/quictransport` | 861 | 9 | QUIC listener/dialer, stream->net.Conn, TLS bootstrap, conn pool |
 | `internal/router` | 273 | 8 | escalation with hop budget and peer ordering |
 | `internal/interop` | 292 | 3 | fixture generation + cross-language verification |
-| `internal/taskstore` | 353 | 4 | atomic persistence + terminal pruning |
+| `internal/taskstore` | 480 | 4 | write-behind persistence (coalesced atomic flush) + terminal pruning |
 | `pkg/client` | 242 | 3 | ProbeAll: fan-out, verify, rank |
 | `internal/metrics` | 55 | - | Prometheus text counters, no client dep |
 | `internal/schemareg` | 189 | 8 | media-type registry and payload validation |

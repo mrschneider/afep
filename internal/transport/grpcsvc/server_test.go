@@ -296,7 +296,8 @@ func TestTaskStreamEcho(t *testing.T) {
 func TestTaskStoreSurvivesRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tasks.json")
 	self := mustCard(t, "local/vision", "vision.tag", "tenant:acme")
-	c := startService(t, self, nil, WithTaskStore(mustStore(t, path)))
+	st := mustStore(t, path)
+	c := startService(t, self, nil, WithTaskStore(st))
 
 	stream, err := c.Probe(context.Background(), &afepv1.ProbeRequest{Tenant: "acme", Capability: "vision.tag"})
 	if err != nil {
@@ -308,6 +309,11 @@ func TestTaskStoreSurvivesRestart(t *testing.T) {
 	}
 	taskID := msg.GetTaskId()
 	if _, err := c.Commit(context.Background(), &afepv1.CommitRequest{TaskId: taskID, WinnerAgent: "local/vision"}); err != nil {
+		t.Fatal(err)
+	}
+	// Durability barrier: the server keeps the store open (write-behind),
+	// so flush before simulating the restart by reopening the file.
+	if err := st.Flush(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -372,6 +378,7 @@ func mustStore(t *testing.T, path string) *taskstore.Store {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = st.Close() })
 	return st
 }
 

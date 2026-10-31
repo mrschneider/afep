@@ -141,6 +141,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("taskstore: %v", err)
 	}
+	// Write-behind store: Close performs the final synchronous flush so
+	// no accepted task is lost on shutdown.
+	defer func() {
+		if err := store.Close(); err != nil {
+			log.Printf("taskstore close: %v", err)
+		}
+	}()
 	store.SetMaxTasks(int(*maxTasks))
 	if *pruneAge > 0 {
 		if n, err := store.PruneTerminal(*pruneAge, time.Now()); err != nil {

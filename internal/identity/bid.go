@@ -50,7 +50,7 @@ func VerifyBid(bid *afepv1.Bid, card *afepv1.AgentCard) error {
 	if err != nil {
 		return fmt.Errorf("afep/identity: marshal: %w", err)
 	}
-	if err := VerifyCard(card); err != nil {
+	if err := verifyCardCached(card); err != nil {
 		return fmt.Errorf("afep/identity: card: %w", err)
 	}
 	if !ed25519.Verify(card.GetPublicKey(), body, bid.GetSignature()) {

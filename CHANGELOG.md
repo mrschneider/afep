@@ -3,6 +3,41 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.0] — 2026-10-30
+
+### Changed
+
+- **Performance round** (benchmarked against v0.6.0, `-benchmem -count=3`):
+  - `taskstore`: write-behind flusher — `Put`/`PruneTerminal` update the
+    in-memory map and mark the store dirty; a single background writer
+    coalesces bursts into one atomic tmp+rename snapshot per 100 ms window.
+    `Flush`/`Close` are synchronous durability barriers; the daemon calls
+    `Close` on shutdown so no accepted task is lost.
+    `BenchmarkPut`: **41,316 → ~2,056 ns/op (~20x)**, 36 → 13 allocs.
+  - `identity`: `VerifyCard` memoization (`verifyCardCached`) keyed on the
+    deterministically marshaled card bytes — a card's bytes verify forever,
+    so the per-hop issuer check is cached (bounded at 4096 entries, whole
+    cache dropped on overflow; poison results cached too).
+    `BenchmarkVerifyEnvelope`: **226,660 → ~116,341 ns/op (~2x)**.
+  - `quictransport`: connection pool — `DialFunc`/`NewDialer` now reuse a
+    single QUIC connection per peer (multiplexed streams) instead of a
+    fresh TLS 1.3 handshake per RPC; dead connections are detected via the
+    connection context and redialed transparently.
+  - `bus/nats`: bid JetStream archive decoupled from the live bid path —
+    `PublishBid` enqueues (bounded, 1024) and a single worker publishes in
+    the background; a full queue drops the archive (counted in
+    `BidArchiveFailed`) and never blocks the live bid.
+- `taskstore`: `Store.Close` added (stops the writer, final flush);
+  `Flush` is the explicit durability barrier for callers that cannot rely
+  on the background window.
+
+### Added
+
+- `BenchmarkPutFlush10k` (coalesced flush cost with a 10k-task store),
+  pool tests (reuse, redial-after-peer-close, closed-pool refusal,
+  16-goroutine concurrent gets under `-race`), and `Close` coverage in
+  the taskstore/fuzz/grpcsvc suites.
+
 ## [0.6.0] - 2026-10-26
 
 ### Added

@@ -25,6 +25,9 @@ func TestPersistenceAcrossReopen(t *testing.T) {
 	if err := s.Put(env); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// reopen = restart
 	s2, err := Open(path)
@@ -70,6 +73,9 @@ func TestPruneTerminal(t *testing.T) {
 	if _, ok := s.Get("live-old"); !ok {
 		t.Fatal("non-terminal task must survive")
 	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
 	// prune is persisted too
 	s2, _ := Open(path)
 	if _, ok := s2.Get("done-old"); ok {
@@ -91,7 +97,11 @@ func TestAtomicFilePresent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "tasks.json")
 	s, _ := Open(path)
+	t.Cleanup(func() { _ = s.Close() })
 	_ = s.Put(&afepv1.TaskEnvelope{TaskId: "x", State: afepv1.TaskState_TASK_STATE_PROBE})
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("state file missing: %v", err)
 	}

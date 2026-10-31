@@ -56,7 +56,7 @@ func VerifyEnvelope(env *afepv1.TaskEnvelope, issuer *afepv1.AgentCard) error {
 	if len(env.GetSignature()) == 0 {
 		return errors.New("afep/identity: envelope is unsigned")
 	}
-	if err := VerifyCard(issuer); err != nil {
+	if err := verifyCardCached(issuer); err != nil {
 		return fmt.Errorf("afep/identity: issuer card: %w", err)
 	}
 	body, err := envelopeBody(env)

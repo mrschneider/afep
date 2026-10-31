@@ -35,9 +35,12 @@ func DialWithTLS(ctx context.Context, addr string, conf *tls.Config) (net.Conn, 
 }
 
 // DialFunc returns a grpc dialer that always targets serverAddr — plug it
-// into grpc.WithContextDialer to run gRPC over QUIC.
+// into grpc.WithContextDialer to run gRPC over QUIC. It reuses a single
+// pooled connection per address (multiplexed streams), so repeated RPCs do
+// not pay a fresh TLS handshake each time.
 func DialFunc(serverAddr string) func(ctx context.Context, _ string) (net.Conn, error) {
+	p := getSharedPool(serverAddr)
 	return func(ctx context.Context, _ string) (net.Conn, error) {
-		return Dial(ctx, serverAddr)
+		return p.get(ctx)
 	}
 }

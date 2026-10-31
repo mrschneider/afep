@@ -26,6 +26,7 @@ func FuzzTaskstoreOpen(f *testing.F) {
 		if err != nil {
 			return // rejection is fine; panics are not
 		}
+		t.Cleanup(func() { _ = s.Close() })
 		s.Len()
 		if _, ok := s.Get("anything"); ok {
 			t.Fatal("unexpected hit on fuzzed store")

@@ -49,6 +49,14 @@ type Bus struct {
 	revokedCache map[string]bool
 	onMu         sync.RWMutex
 	onConn       func(bool)
+	// bidArchiveCh decouples the best-effort JetStream bid archive from
+	// the live bid path: PublishBid enqueues and returns, a single worker
+	// drains it. Bounded so a bid flood cannot grow memory or goroutines
+	// without limit; when full the archive is dropped (counted) and the
+	// live bid — the actual contract — is never blocked by the archive.
+	bidArchiveCh   chan *nats.Msg
+	bidArchiveStop context.CancelFunc
+	bidArchiveDone chan struct{}
 }
 
 // Dial connects to NATS and (re)creates the AFEP stream.
@@ -133,9 +141,36 @@ func Dial(ctx context.Context, url string, extra ...nats.Option) (*Bus, error) {
 		nc: nc, js: js, kv: kv,
 		cardCache:    make(map[string][]byte),
 		revokedCache: make(map[string]bool),
+		bidArchiveCh: make(chan *nats.Msg, 1024),
 	}
 	b.startCardWatcher(ctx)
+	b.startBidArchiver(ctx)
 	return b, nil
+}
+
+// startBidArchiver drains bidArchiveCh with a single worker: the JetStream
+// archive becomes best-effort background work instead of a synchronous
+// roundtrip on the bid path.
+func (b *Bus) startBidArchiver(ctx context.Context) {
+	wctx, cancel := context.WithCancel(ctx)
+	b.bidArchiveStop = cancel
+	b.bidArchiveDone = make(chan struct{})
+	go func() {
+		defer close(b.bidArchiveDone)
+		for {
+			select {
+			case <-wctx.Done():
+				return
+			case msg := <-b.bidArchiveCh:
+				pctx, pcancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if _, err := b.js.PublishMsg(pctx, msg); err != nil {
+					metrics.BidArchiveFailed.Inc()
+					log.Printf("natsbus: bid archive: %v", err) // non-fatal
+				}
+				pcancel()
+			}
+		}
+	}()
 }
 
 // Close tears down the NATS connection.
@@ -145,6 +180,15 @@ func (b *Bus) Close() {
 	}
 	if b.kvStop != nil {
 		b.kvStop()
+	}
+	// Stop the bid archive worker and give it a bounded window to drain
+	// what is already queued; the live path is unaffected either way.
+	if b.bidArchiveStop != nil {
+		b.bidArchiveStop()
+		select {
+		case <-b.bidArchiveDone:
+		case <-time.After(2 * time.Second):
+		}
 	}
 	// Drain flushes buffered publishes and unsubscribes consumers so a
 	// shutdown does not drop messages already handed to the client;
@@ -525,13 +569,16 @@ func (b *Bus) PublishBid(domain, agent string, bid *afepv1.Bid) error {
 	metrics.BidPublished.Inc()
 	// Best-effort JetStream archive (live path above is the contract):
 	// same payload + MsgId, so replays stay idempotent per task+agent.
-	actx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Enqueued for the background worker — the bid must not pay a
+	// JetStream roundtrip on the hot path. A full queue drops the
+	// archive (counted); the live bid is never blocked by it.
 	am := &nats.Msg{Subject: subject, Data: body, Header: make(nats.Header)}
 	am.Header.Set(nats.MsgIdHdr, bid.GetTaskId()+":"+bid.GetAgentId())
-	if _, err := b.js.PublishMsg(actx, am); err != nil {
+	select {
+	case b.bidArchiveCh <- am:
+	default:
 		metrics.BidArchiveFailed.Inc()
-		log.Printf("natsbus: bid archive: %v", err) // non-fatal
+		log.Printf("natsbus: bid archive: queue full, dropped")
 	}
 	return nil
 }
