@@ -36,9 +36,9 @@ type diskState struct {
 
 // Store is an in-memory task map backed by a JSON file.
 type Store struct {
-	mu       sync.RWMutex
-	path     string
-	tasks    map[string]*afepv1.TaskEnvelope
+	mu    sync.RWMutex
+	path  string
+	tasks map[string]*afepv1.TaskEnvelope
 	// raws caches the protojson encoding of each stored envelope so a
 	// flush re-serializes only the task that changed, never all of them.
 	raws map[string]json.RawMessage
