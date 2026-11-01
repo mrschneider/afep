@@ -562,8 +562,8 @@ type envelopeConsumeCtx struct {
 	done chan struct{}
 }
 
-func (c *envelopeConsumeCtx) Stop()   { c.mc.Stop() }
-func (c *envelopeConsumeCtx) Drain()  { c.mc.Drain() }
+func (c *envelopeConsumeCtx) Stop()                   { c.mc.Stop() }
+func (c *envelopeConsumeCtx) Drain()                  { c.mc.Drain() }
 func (c *envelopeConsumeCtx) Closed() <-chan struct{} { return c.done }
 
 // processEnvelope runs one message through the handler with the same

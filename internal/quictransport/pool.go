@@ -29,10 +29,10 @@ var quicConfig = &quic.Config{
 // channel, and every other caller waits for it instead of racing duplicate
 // handshakes — one RTT per peer per epoch, not one per concurrent RPC.
 type connPool struct {
-	mu     sync.Mutex
-	addr   string
-	conf   *tls.Config
-	conn   *quic.Conn
+	mu   sync.Mutex
+	addr string
+	conf *tls.Config
+	conn *quic.Conn
 	// dialing is non-nil while a dial is in flight; its channel carries
 	// the outcome exactly once to every waiter.
 	dialing *dialShared

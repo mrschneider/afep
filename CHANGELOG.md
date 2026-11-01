@@ -3,6 +3,29 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.0] — 2026-10-31
+
+### Changed
+
+- **taskstore: incremental persistence (base+delta, v3 format)** — flush cost
+  is O(delta) not O(store): a 10k-task store went from ~2.2 ms/2.2 MB per
+  flush to ~0.33 ms/0.3 MB. Compaction folds the delta into the base when it
+  exceeds 1/4 of the store (>=128 entries); Close compacts to a single
+  self-contained base; a crash between base and delta is a no-op replay.
+- **grpcsvc: store as single source of truth** — save drops the server-side
+  envelope clone (store.Put clones at its boundary); load reads through the
+  store. One copy per envelope, not two.
+- **identity: cheap verify-cache key** — length-prefixed sha256 of the
+  signed-core fields (no clone + deterministic marshal on hits); hit cost
+  ~1.8us -> ~0.6us. A key collision can only force a re-verify, never a bad
+  accept (ed25519 still runs on every miss).
+- **natsbus: tunable envelope worker pool** — `Bus.SetEnvelopeWorkers` /
+  `-envelope-workers`; default max(4, GOMaxProcs) (verify path is CPU-bound).
+- **quictransport: shared first-contact dial** — concurrent RPCs to a peer
+  share one dial (claim + shared outcome channel) instead of serializing
+  behind the pool lock; per-waiter cancellation leaves the shared dial
+  running.
+
 ## [0.7.0] — 2026-10-30
 
 ### Changed
