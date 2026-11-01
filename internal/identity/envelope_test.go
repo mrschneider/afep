@@ -90,3 +90,65 @@ func TestEnvelopeNeedsTaskID(t *testing.T) {
 		t.Fatal("id-less envelope must fail")
 	}
 }
+
+// TestEnvelopeVerifyCacheHit re-verifying the same (core, key, sig) tuple
+// must return the cached result without re-running ed25519: a second
+// verification of an identical envelope is correct, and verification after
+// the envelope's RELAY-MUTABLE tail changes (same signed core) must still
+// verify — that is the redelivery case the cache exists for.
+func TestEnvelopeVerifyCacheHit(t *testing.T) {
+	kp, err := Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	card, err := NewCard("t/cache", "cache", kp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := &afepv1.TaskEnvelope{TaskId: "e1", Tenant: "t", IssuerAgent: "t/cache"}
+	if err := SignEnvelope(env, kp); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyEnvelope(env, card); err != nil {
+		t.Fatal(err)
+	}
+	// Relay-mutable tail changes: the signed core is untouched, so the
+	// cached signature result must apply and verification must pass.
+	env.Hops = 3
+	env.State = afepv1.TaskState_TASK_STATE_ESCALATED
+	if err := VerifyEnvelope(env, card); err != nil {
+		t.Fatalf("tail-mutated envelope must verify via cache: %v", err)
+	}
+	// Tampered core: new digest, must be re-verified and REJECTED (and
+	// the poisoned result cached, so repeated checks stay cheap).
+	env.Payload = append([]byte(nil), env.Payload...)
+	env.Payload = append(env.Payload, 'x')
+	if err := VerifyEnvelope(env, card); err == nil {
+		t.Fatal("tampered core must not verify")
+	}
+	if err := VerifyEnvelope(env, card); err == nil {
+		t.Fatal("tampered core must not verify (cached)")
+	}
+}
+
+// TestEnvelopeVerifyCacheKeyedByIssuerKey: the same signed core presented
+// under a DIFFERENT issuer key (re-issued card, same id) must NOT ride the
+// first key's cached result.
+func TestEnvelopeVerifyCacheKeyedByIssuerKey(t *testing.T) {
+	kp1, _ := Generate()
+	kp2, _ := Generate()
+	card1, _ := NewCard("t/same-id", "one", kp1, nil)
+	env := &afepv1.TaskEnvelope{TaskId: "e2", Tenant: "t", IssuerAgent: "t/same-id"}
+	if err := SignEnvelope(env, kp1); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyEnvelope(env, card1); err != nil {
+		t.Fatal(err)
+	}
+	// Re-issued card: same id, new key. The cached result of key1 must
+	// not apply; verification against key2 must fail.
+	card2, _ := NewCard("t/same-id", "two", kp2, nil)
+	if err := VerifyEnvelope(env, card2); err == nil {
+		t.Fatal("re-issued issuer key must not inherit the cached verify")
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -50,6 +51,7 @@ func main() {
 	pruneAge := flag.Duration("prune-age", 24*time.Hour, "prune terminal tasks older than this (0 disables)")
 	maxTasks := flag.Uint("max-tasks", 100000, "hard cap on stored tasks (0 = unlimited)")
 	grpcRate := flag.Float64("grpc-rate", 200, "gRPC ingress requests/messages per second (0 disables)")
+	envelopeWorkers := flag.Int("envelope-workers", 0, "mesh envelope worker pool size (0 = max(4, GOMaxProcs))")
 	revokeCard := flag.String("revoke-card", "", "revoke an issuer card id in the KV bucket and exit")
 	quicProbe := flag.String("quic-probe", "", "dial this gRPC-over-QUIC address, health-check it and exit")
 	quicCA := flag.String("quic-ca", "", "PEM certificate to pin for -quic-probe (default: dev skip-verify)")
@@ -197,6 +199,7 @@ func main() {
 		} else {
 			bus = b
 			defer bus.Close()
+			bus.SetEnvelopeWorkers(*envelopeWorkers)
 			bus.LogStatsEvery(ctx, 5*time.Minute) // pending/redeliveries visibility
 			// Readiness follows the broker: SERVING now, then flipped by
 			// the connection handlers.
@@ -230,6 +233,10 @@ func main() {
 				log.Fatalf("mesh: %v", err)
 			}
 			durable := "afepd-" + sanitize(*agentID)
+			// Per-envelope logging is a syscall on the hot path: sample
+			// the steady state (1 in 50) — every outcome is still
+			// visible in /metrics, and a flood cannot drown the log.
+			var handled atomic.Uint64
 			if _, err := bus.SubscribeEnvelopes(ctx, *domain, durable, func(env *afepv1.TaskEnvelope) error {
 				// Per-message deadline: the subscribe ctx has no timeout, so a
 				// wedged publish could block the consumer loop forever.
@@ -241,8 +248,10 @@ func main() {
 					}
 					return err // transient: Nak + redelivery
 				}
-				log.Printf("mesh: handled task=%s state=%s cap=%s hops=%d",
-					env.GetTaskId(), env.GetState(), env.GetCapability(), env.GetHops())
+				if n := handled.Add(1); n%50 == 1 {
+					log.Printf("mesh: handled task=%s state=%s cap=%s hops=%d (sampled, total=%d)",
+						env.GetTaskId(), env.GetState(), env.GetCapability(), env.GetHops(), n)
+				}
 				return nil
 			}); err != nil {
 				log.Printf("nats: subscribe: %v", err)
@@ -317,6 +326,21 @@ func main() {
 	if *pruneAge > 0 {
 		go pruneLoop(ctx, store, *pruneAge)
 	}
+	// Store size is an instant value, not an event: a low-frequency
+	// ticker keeps the gauge fresh without touching the hot path.
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		metrics.TaskStoreSize.Set(int64(store.Len()))
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				metrics.TaskStoreSize.Set(int64(store.Len()))
+			}
+		}
+	}()
 	log.Printf("afepd: ready (key=%s state=%s score=%d prune=%s)", *keyPath, *statePath, *bidScore, *pruneAge)
 
 	<-ctx.Done()

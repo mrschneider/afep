@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	afepv1 "github.com/mrschneider/afep/gen/go/afep/v1"
 	"github.com/mrschneider/afep/internal/clearance"
@@ -117,6 +118,8 @@ func New(cfg Config) (*Handler, error) {
 //   - hop-limit / exhausted chain: acknowledged and dropped;
 //   - any other state: acknowledged unchanged.
 func (h *Handler) OnEnvelope(ctx context.Context, env *afepv1.TaskEnvelope) error {
+	start := time.Now()
+	defer func() { metrics.EnvelopeHandleSeconds.Observe(time.Since(start).Nanoseconds()) }()
 	if env == nil {
 		return fmt.Errorf("%w: nil envelope", ErrRejected)
 	}

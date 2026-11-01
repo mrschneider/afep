@@ -5,7 +5,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/hex"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
@@ -122,42 +122,43 @@ const cardCacheCap = 4096
 
 var (
 	cardCacheMu sync.Mutex
-	cardCache   = make(map[string]error)
+	cardCache   = make(map[[32]byte]error)
 )
 
-func cardCacheKey(card *afepv1.AgentCard) string {
+func cardCacheKey(card *afepv1.AgentCard) ([32]byte, bool) {
 	// The FULL card (body + signature) is the key: the signature covers
 	// the body minus the signature field, so two artifacts sharing
 	// (id, pubkey, signature) but differing in body are distinct — and
 	// only one can be valid. Keying on anything less would let a
 	// tampered body ride a valid card's cached result. A deterministic
-	// marshal makes equal cards hash equal; the cost (~a clone+marshal)
-	// is negligible against the ed25519 verify it avoids.
+	// marshal makes equal cards digest equal; the sha256 of the bytes
+	// is the map key (collision-safe at 256 bits, and it is the digest
+	// of the exact signed artifact, not a field projection).
 	body, err := proto.MarshalOptions{Deterministic: true}.Marshal(card)
 	if err != nil {
-		return "" // unmarshalable: never cache, always verify
+		return [32]byte{}, false // unmarshalable: never cache, always verify
 	}
-	return hex.EncodeToString(body)
+	return sha256.Sum256(body), true
 }
 
 // verifyCardCached is VerifyCard with a memoization layer. The cache stores
 // the full result (including the error) so a poisoned card is not re-verified
 // on every hop either.
 func verifyCardCached(card *afepv1.AgentCard) error {
-	key := cardCacheKey(card)
-	if key != "" {
+	key, ok := cardCacheKey(card)
+	if ok {
 		cardCacheMu.Lock()
-		if v, ok := cardCache[key]; ok {
+		if v, hit := cardCache[key]; hit {
 			cardCacheMu.Unlock()
 			return v
 		}
 		cardCacheMu.Unlock()
 	}
 	err := VerifyCard(card)
-	if key != "" {
+	if ok {
 		cardCacheMu.Lock()
 		if len(cardCache) >= cardCacheCap {
-			cardCache = make(map[string]error)
+			cardCache = make(map[[32]byte]error)
 		}
 		cardCache[key] = err
 		cardCacheMu.Unlock()

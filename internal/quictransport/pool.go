@@ -23,12 +23,41 @@ var quicConfig = &quic.Config{
 // the TLS 1.3 handshake, every subsequent RPC opens a multiplexed stream
 // over the same connection. A dead connection (idle timeout, peer reset) is
 // detected via the connection context and redialed transparently.
+//
+// Concurrent first-contact RPCs share ONE dial: the dialer that claims the
+// in-flight state publishes the result (connection or error) on the shared
+// channel, and every other caller waits for it instead of racing duplicate
+// handshakes — one RTT per peer per epoch, not one per concurrent RPC.
 type connPool struct {
 	mu     sync.Mutex
 	addr   string
 	conf   *tls.Config
 	conn   *quic.Conn
-	closed bool
+	// dialing is non-nil while a dial is in flight; its channel carries
+	// the outcome exactly once to every waiter.
+	dialing *dialShared
+	closed  bool
+}
+
+// dialShared is the in-flight dial outcome shared by concurrent callers.
+// The claimant writes conn/err and then closes done; the close
+// establishes happens-before, so ANY NUMBER of waiters can read
+// conn/err safely after <-done (a channel value would only reach one
+// reader).
+type dialShared struct {
+	done chan struct{}
+	conn *quic.Conn
+	err  error
+}
+
+// closed reports whether the outcome has been published.
+func (d *dialShared) closed() bool {
+	select {
+	case <-d.done:
+		return true
+	default:
+		return false
+	}
 }
 
 func newConnPool(addr string, conf *tls.Config) *connPool {
@@ -58,31 +87,86 @@ func (p *connPool) get(ctx context.Context) (net.Conn, error) {
 	return nil, lastErr
 }
 
-// aliveConn returns the live pooled connection, dialing under the lock when
-// there is none. Dialing under the lock serializes the first concurrent RPCs
-// to the same peer on a single handshake — a deliberate trade that avoids
-// racing duplicate connections and keeps the pool to exactly one conn/peer.
+// aliveConn returns the live pooled connection. When there is none it
+// dials — and concurrent callers SHARE that dial: the first caller claims
+// the in-flight state and publishes the outcome on a shared channel, every
+// other caller (including ones that arrive mid-handshake) waits for the
+// same result. This keeps the pool to exactly one conn/peer while making
+// the first fan-out cost ONE handshake, not one per concurrent RPC.
+//
+// Cancellation is per-waiter: a caller whose context expires is released
+// (it gets ctx.Err()) without canceling the shared dial for the rest.
 func (p *connPool) aliveConn(ctx context.Context) (*quic.Conn, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		return nil, fmt.Errorf("afep/quic: pool to %s is closed", p.addr)
-	}
-	if p.conn != nil {
-		// The connection context is canceled when the QUIC connection
-		// closes (idle timeout, peer reset, explicit close).
-		if p.conn.Context().Err() == nil {
-			return p.conn, nil
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("afep/quic: pool to %s is closed", p.addr)
 		}
-		_ = p.conn.CloseWithError(0, "stale")
-		p.conn = nil
+		if p.conn != nil {
+			// The connection context is canceled when the QUIC connection
+			// closes (idle timeout, peer reset, explicit close).
+			if p.conn.Context().Err() == nil {
+				c := p.conn
+				p.mu.Unlock()
+				return c, nil
+			}
+			_ = p.conn.CloseWithError(0, "stale")
+			p.conn = nil
+		}
+		if d := p.dialing; d != nil {
+			// A dial is already in flight: wait for ITS outcome.
+			p.mu.Unlock()
+			res, ok := waitForDial(ctx, d)
+			if !ok {
+				return nil, res.err
+			}
+			return res.conn, res.err
+		}
+		// Claim the dial. The claimant ALWAYS publishes the outcome
+		// before returning — even when its own context expires
+		// mid-handshake — or the other waiters would block forever.
+		d := &dialShared{done: make(chan struct{})}
+		p.dialing = d
+		p.mu.Unlock()
+
+		c, err := quic.DialAddr(ctx, p.addr, p.conf, quicConfig)
+		if err != nil {
+			err = fmt.Errorf("afep/quic: dial %s: %w", p.addr, err)
+		} else {
+			p.mu.Lock()
+			p.conn = c
+			p.dialing = nil
+			p.mu.Unlock()
+		}
+		d.conn, d.err = c, err
+		close(d.done) // wakes every waiter; writes above are visible
+		p.mu.Lock()
+		if p.dialing == d {
+			p.dialing = nil
+		}
+		p.mu.Unlock()
+		return c, err
 	}
-	c, err := quic.DialAddr(ctx, p.addr, p.conf, quicConfig)
-	if err != nil {
-		return nil, fmt.Errorf("afep/quic: dial %s: %w", p.addr, err)
+}
+
+// dialOutcome is the published result of a shared dial.
+type dialOutcome struct {
+	conn *quic.Conn
+	err  error
+}
+
+// waitForDial blocks until the shared dial publishes its outcome or the
+// caller's context is done (whichever first). A canceled caller is simply
+// released with its own error: the dial keeps running for the other
+// waiters.
+func waitForDial(ctx context.Context, d *dialShared) (dialOutcome, bool) {
+	select {
+	case <-ctx.Done():
+		return dialOutcome{err: ctx.Err()}, false
+	case <-d.done:
+		return dialOutcome{conn: d.conn, err: d.err}, true
 	}
-	p.conn = c
-	return c, nil
 }
 
 // evict drops a specific connection from the pool if it is still the current

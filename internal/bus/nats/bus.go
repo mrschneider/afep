@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -57,6 +58,9 @@ type Bus struct {
 	bidArchiveCh   chan *nats.Msg
 	bidArchiveStop context.CancelFunc
 	bidArchiveDone chan struct{}
+	// envelopeWorkers sizes the SubscribeEnvelopes worker pool (0 =
+	// defaultEnvelopeWorkers).
+	envelopeWorkers int
 }
 
 // Dial connects to NATS and (re)creates the AFEP stream.
@@ -381,7 +385,9 @@ func (b *Bus) PublishEnvelope(ctx context.Context, domain, agent string, env *af
 	if err != nil {
 		return err
 	}
-	body, err := proto.MarshalOptions{Deterministic: true}.Marshal(env)
+	// Wire payloads do NOT need deterministic bytes: the dedup key is the
+	// MsgId header below, and receivers unmarshal structurally.
+	body, err := proto.Marshal(env)
 	if err != nil {
 		return fmt.Errorf("afep/natsbus: marshal: %w", err)
 	}
@@ -424,8 +430,35 @@ func redeliveryDelay(attempt int) time.Duration {
 // EnvelopeHandler returns nil to ack the message or an error to redeliver.
 type EnvelopeHandler func(*afepv1.TaskEnvelope) error
 
+// defaultEnvelopeWorkers sizes the envelope worker pool: envelope
+// handling is CPU-bound (ed25519), so the pool tracks the cores — with a
+// floor of 4 for the single/dual-core daemons where GOMaxProcs < 4 would
+// serialize the verify path.
+func defaultEnvelopeWorkers() int {
+	if n := runtime.GOMAXPROCS(0); n > 4 {
+		return n
+	}
+	return 4
+}
+
+// SetEnvelopeWorkers resizes the envelope consumer's worker pool; call it
+// BEFORE SubscribeEnvelopes. A value <= 0 keeps the default.
+func (b *Bus) SetEnvelopeWorkers(n int) {
+	if n > 0 {
+		b.envelopeWorkers = n
+	}
+}
+
 // SubscribeEnvelopes consumes afep.<domain>.*.envelopes on a durable
 // consumer: the queue survives disconnects and replays after recovery.
+//
+// The consumer runs a single dispatcher goroutine (one caller of
+// MessagesContext.Next) that fans out to a small worker pool. Envelope
+// handling is CPU-bound (ed25519 verify) and parallelizes well; the pool
+// bounds concurrency so MaxAckPending (server-side) stays the work-in-
+// flight ceiling and a slow handler cannot wedge the dispatcher.
+// Envelope order is NOT preserved by design: tasks are independent and
+// dedup/audit order is stream-qualified by (task, state, hops).
 func (b *Bus) SubscribeEnvelopes(ctx context.Context, domain, durable string, h EnvelopeHandler) (jetstream.ConsumeContext, error) {
 	filter, err := Subject(domain, Wildcard, VerbEnvelopes)
 	if err != nil {
@@ -442,10 +475,11 @@ func (b *Bus) SubscribeEnvelopes(ctx context.Context, domain, durable string, h 
 		DeliverPolicy: jetstream.DeliverNewPolicy,
 		// Explicit ack window covering slow handlers; server-side BackOff
 		// is the safety net for SILENT handlers (neither Ack nor Nak) —
-		// explicit failures still use NakWithDelay in the loop below.
+		// explicit failures still use NakWithDelay in the worker below.
 		AckWait: 60 * time.Second,
 		BackOff: []time.Duration{60 * time.Second, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 30 * time.Minute},
-		// Single-threaded handler: bound the unacked work in flight.
+		// The dispatcher pulls at most this many messages into the pool
+		// at once; the pool size below is what parallelizes the handler.
 		MaxAckPending: 100,
 	}
 	cons, err := b.js.CreateOrUpdateConsumer(ctx, StreamName, cfg)
@@ -463,46 +497,112 @@ func (b *Bus) SubscribeEnvelopes(ctx context.Context, domain, durable string, h 
 		}
 	}
 	b.statsCons = cons
-	cc, err := cons.Consume(func(msg jetstream.Msg) {
-		// A handler panic must not take the whole daemon down: term the
-		// message, log the stack, keep the consumer alive.
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("natsbus: handler panic (term): %v\n%s", r, debug.Stack())
-				metrics.EnvelopePanic.Inc()
-				_ = msg.Term()
-			}
-		}()
-		env := &afepv1.TaskEnvelope{}
-		if err := proto.Unmarshal(msg.Data(), env); err != nil {
-			metrics.EnvelopeTerm.Inc()
-			_ = msg.Term() // poison message: stop redelivering it
-			return
-		}
-		_ = msg.InProgress() // extend the ack window across handler execution
-		if err := h(env); err != nil {
-			if errors.Is(err, ErrTerm) {
-				metrics.EnvelopeTerm.Inc()
-				_ = msg.Term()
-			} else {
-				metrics.EnvelopeNak.Inc()
-				// Backoff instead of a hot redelivery loop: MaxDeliver=5
-				// bounds attempts, the delay spreads them out.
-				delay := 2 * time.Second
-				if meta, err := msg.Metadata(); err == nil {
-					delay = redeliveryDelay(int(meta.NumDelivered))
-				}
-				_ = msg.NakWithDelay(delay)
-			}
-			return
-		}
-		metrics.EnvelopeAck.Inc()
-		_ = msg.Ack()
-	})
+	mc, err := cons.Messages()
+	if err != nil {
+		return nil, fmt.Errorf("afep/natsbus: messages: %w", err)
+	}
+	cc, err := b.consumeWithPool(ctx, mc, h)
 	if err != nil {
 		return nil, fmt.Errorf("afep/natsbus: consume: %w", err)
 	}
 	return cc, nil
+}
+
+// consumeWithPool wires a dispatcher (single Next caller) to a worker pool.
+// It returns a ConsumeContext whose Stop/Drain shuts the dispatcher down
+// and whose Closed channel closes once dispatcher and workers have joined.
+func (b *Bus) consumeWithPool(ctx context.Context, mc jetstream.MessagesContext, h EnvelopeHandler) (jetstream.ConsumeContext, error) {
+	workers := b.envelopeWorkers
+	if workers <= 0 {
+		workers = defaultEnvelopeWorkers()
+	}
+	jobs := make(chan jetstream.Msg, workers)
+	done := make(chan struct{})
+
+	// Dispatcher: the ONLY caller of mc.Next. It pulls messages and
+	// hands them to the pool; when the iterator stops (Stop/Drain,
+	// context cancellation) it closes the job channel so workers can
+	// drain and exit.
+	go func() {
+		defer close(jobs)
+		for {
+			msg, err := mc.Next()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("natsbus: envelope consumer stopped: %v", err)
+				return
+			}
+			jobs <- msg
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for msg := range jobs {
+				b.processEnvelope(msg, h)
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return &envelopeConsumeCtx{mc: mc, done: done}, nil
+}
+
+// envelopeConsumeCtx adapts a MessagesContext to the ConsumeContext
+// surface the caller uses (Stop/Drain/Closed).
+type envelopeConsumeCtx struct {
+	mc   jetstream.MessagesContext
+	done chan struct{}
+}
+
+func (c *envelopeConsumeCtx) Stop()   { c.mc.Stop() }
+func (c *envelopeConsumeCtx) Drain()  { c.mc.Drain() }
+func (c *envelopeConsumeCtx) Closed() <-chan struct{} { return c.done }
+
+// processEnvelope runs one message through the handler with the same
+// ack/nak/term/panic semantics the previous single-threaded loop had.
+func (b *Bus) processEnvelope(msg jetstream.Msg, h EnvelopeHandler) {
+	// A handler panic must not take the whole daemon down: term the
+	// message, log the stack, keep the consumer alive.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("natsbus: handler panic (term): %v\n%s", r, debug.Stack())
+			metrics.EnvelopePanic.Inc()
+			_ = msg.Term()
+		}
+	}()
+	env := &afepv1.TaskEnvelope{}
+	if err := proto.Unmarshal(msg.Data(), env); err != nil {
+		metrics.EnvelopeTerm.Inc()
+		_ = msg.Term() // poison message: stop redelivering it
+		return
+	}
+	_ = msg.InProgress() // extend the ack window across handler execution
+	if err := h(env); err != nil {
+		if errors.Is(err, ErrTerm) {
+			metrics.EnvelopeTerm.Inc()
+			_ = msg.Term()
+		} else {
+			metrics.EnvelopeNak.Inc()
+			// Backoff instead of a hot redelivery loop: MaxDeliver=5
+			// bounds attempts, the delay spreads them out.
+			delay := 2 * time.Second
+			if meta, err := msg.Metadata(); err == nil {
+				delay = redeliveryDelay(int(meta.NumDelivered))
+			}
+			_ = msg.NakWithDelay(delay)
+		}
+		return
+	}
+	metrics.EnvelopeAck.Inc()
+	_ = msg.Ack()
 }
 
 // PutCard stores a signed card in the KV bucket.
@@ -510,7 +610,7 @@ func (b *Bus) PutCard(ctx context.Context, card *afepv1.AgentCard) error {
 	if b.kv == nil {
 		return errors.New("afep/natsbus: kv not initialized")
 	}
-	body, err := proto.MarshalOptions{Deterministic: true}.Marshal(card)
+	body, err := proto.Marshal(card)
 	if err != nil {
 		return fmt.Errorf("afep/natsbus: marshal: %w", err)
 	}
@@ -557,7 +657,7 @@ func (b *Bus) PublishBid(domain, agent string, bid *afepv1.Bid) error {
 	if err != nil {
 		return err
 	}
-	body, err := proto.MarshalOptions{Deterministic: true}.Marshal(bid)
+	body, err := proto.Marshal(bid)
 	if err != nil {
 		return fmt.Errorf("afep/natsbus: marshal bid: %w", err)
 	}

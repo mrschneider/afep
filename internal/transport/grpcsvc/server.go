@@ -28,6 +28,9 @@ const defaultBidScore = 100
 
 // Server implements AgentTransportService: signed self-bids, clearance
 // admission, schema-validated envelopes and an optional durable task store.
+// When a store is configured it is the SINGLE source of truth for task
+// state (the store clones at its Put boundary, so no server-side copy is
+// kept); without one the service falls back to an in-memory map.
 type Server struct {
 	afepv1.UnimplementedAgentTransportServiceServer
 
@@ -42,6 +45,9 @@ type Server struct {
 	// envelopes whose issuer card was revoked.
 	revocations func(context.Context, string) (bool, error)
 
+	// Memory fallback used ONLY when no store is configured: the store
+	// (which clones at its Put boundary) is the source of truth in
+	// production and the server keeps no second copy.
 	mu    sync.RWMutex
 	tasks map[string]*afepv1.TaskEnvelope
 }
@@ -82,10 +88,14 @@ func New(self *afepv1.AgentCard, reg *registry.Registry, kp *identity.KeyPair, o
 		kp:      kp,
 		schemas: schemareg.New(),
 		score:   defaultBidScore,
-		tasks:   make(map[string]*afepv1.TaskEnvelope),
 	}
 	for _, o := range opts {
 		o(s)
+	}
+	// The memory fallback exists only without a durable store (the
+	// store is the source of truth when present — one copy, not two).
+	if s.store == nil {
+		s.tasks = make(map[string]*afepv1.TaskEnvelope)
 	}
 	return s, nil
 }
@@ -286,29 +296,34 @@ func (s *Server) verifyIngressEnvelope(ctx context.Context, env *afepv1.TaskEnve
 	return nil
 }
 
-// save records the envelope in memory and, when configured, flushes it to
-// the durable task store.
+// save records the envelope. When a durable store is configured it is the
+// single source of truth — the store clones at its Put boundary, so the
+// server keeps no second copy and the RPC request object never aliases
+// state. Without a store the in-memory map is used (clone required, as
+// RPC objects must not alias the map).
 func (s *Server) save(env *afepv1.TaskEnvelope) error {
-	s.mu.Lock()
-	// server-owned copy: RPC request objects must never alias the
-	// map (the store clones again at its own boundary in Put).
-	s.tasks[env.GetTaskId()] = proto.Clone(env).(*afepv1.TaskEnvelope)
-	s.mu.Unlock()
 	if s.store != nil {
 		return s.store.Put(env)
 	}
+	s.mu.Lock()
+	s.tasks[env.GetTaskId()] = proto.Clone(env).(*afepv1.TaskEnvelope)
+	s.mu.Unlock()
 	return nil
 }
 
+// load returns a private copy of the stored envelope (callers may mutate
+// the result in place, e.g. Commit).
 func (s *Server) load(id string) (*afepv1.TaskEnvelope, bool) {
+	if s.store != nil {
+		// Store.Get hands out a fresh clone: the caller owns it.
+		return s.store.Get(id)
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	env, ok := s.tasks[id]
 	if !ok {
 		return nil, false
 	}
-	// callers own the value: Commit mutates the result in place, so it
-	// must be a private copy or it races concurrent saves/flushes.
 	return proto.Clone(env).(*afepv1.TaskEnvelope), true
 }
 

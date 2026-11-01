@@ -12,10 +12,13 @@ import (
 // Open must reject garbage without panicking, and a store that does
 // open must stay usable (Len/Get/Put including the flush path).
 func FuzzTaskstoreOpen(f *testing.F) {
+	// v1 (JSON) and v2 (binary) shapes, plus raw garbage.
 	f.Add([]byte("{}"))
 	f.Add([]byte(`{"version":1,"tasks":{}}`))
 	f.Add([]byte(`{"version":1,"tasks":{"x":{"task_id":"x"}}}`))
 	f.Add([]byte(`{"version":99}`))
+	f.Add([]byte("AFEPST02")) // v2 magic, truncated
+	f.Add(encodeV2(map[string][]byte{"x": []byte{0x0a, 0x01, 0x78}}))
 	f.Add([]byte{0x00, 0xff, 0x13})
 	path := filepath.Join(f.TempDir(), "tasks.json")
 	f.Fuzz(func(t *testing.T, data []byte) {
