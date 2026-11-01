@@ -146,6 +146,8 @@ func (p *connPool) aliveConn(ctx context.Context) (*quic.Conn, error) {
 			p.dialing = nil
 		}
 		p.mu.Unlock()
+		//lint:ignore SA4004 single-pass on purpose: every branch returns;
+		// the loop form keeps the claim/inspect structure readable.
 		return c, err
 	}
 }
