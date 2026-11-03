@@ -15,6 +15,7 @@ import (
 	"github.com/mrschneider/afep/internal/metrics"
 	"github.com/mrschneider/afep/internal/router"
 	"github.com/mrschneider/afep/internal/schemareg"
+	"sync"
 )
 
 // ErrRejected marks envelopes that failed the schema boundary: consumers
@@ -163,6 +164,16 @@ func (h *Handler) verifyIssuer(ctx context.Context, env *afepv1.TaskEnvelope) er
 	if !ok {
 		return fmt.Errorf("%w: unknown issuer %q", ErrRejected, issuer)
 	}
+	// Verify the signature BEFORE the revocation lookup. The signature check
+	// is cheap on a cache hit (verifyCardCached + cached ed25519 result in
+	// ~4 µs) and rejects poisoned envelopes outright; the revocation lookup
+	// is a separate network round-trip that is only worth paying once we know
+	// the signature is valid. Reordering means a tampered envelope pays the
+	// revocation lookup never. Revocation still runs after the verify so a
+	// revoked-but-validly-signed issuer is caught.
+	if err := identity.VerifyEnvelope(env, card); err != nil {
+		return fmt.Errorf("%w: issuer signature: %v", ErrRejected, err)
+	}
 	if h.revocations != nil {
 		revoked, rerr := h.revocations.IsRevoked(ctx, issuer)
 		if rerr != nil {
@@ -172,9 +183,6 @@ func (h *Handler) verifyIssuer(ctx context.Context, env *afepv1.TaskEnvelope) er
 			metrics.RevokedRejected.Inc()
 			return fmt.Errorf("%w: issuer %q is revoked", ErrRejected, issuer)
 		}
-	}
-	if err := identity.VerifyEnvelope(env, card); err != nil {
-		return fmt.Errorf("%w: issuer signature: %v", ErrRejected, err)
 	}
 	return nil
 }
@@ -209,10 +217,41 @@ func subjectAgent(id string) string {
 }
 
 func hasCapability(card *afepv1.AgentCard, name string) bool {
-	for _, c := range card.GetCapabilities() {
-		if c.GetName() == name {
-			return true
+	caps := capabilitySet(card.GetId(), card.GetCapabilities())
+	_, ok := caps[name]
+	return ok
+}
+
+// capabilitySet builds an O(1) lookup set from a card's capabilities. Cards are
+// shared across goroutines and immutable, so the map is built once behind a
+// sync.Once guarded per card ID. The first hasCapability call pays the O(n)
+// scan; every subsequent call is a map lookup. This replaces the per-call O(n)
+// linear scan that ran on the hot serve path. Keyed on the card ID (stable and
+// hashable) rather than the card pointer or capabilities slice.
+func capabilitySet(id string, list []*afepv1.Capability) map[string]struct{} {
+	guard, ok := capabilityGuards.Load(id)
+	if !ok {
+		oc := &capabilityOnce{}
+		if guard, ok = capabilityGuards.LoadOrStore(id, oc); !ok {
+			oc.once.Do(func() {
+				cap := make(map[string]struct{}, len(list))
+				for _, capItem := range list {
+					if n := capItem.GetName(); n != "" {
+						cap[n] = struct{}{}
+					}
+				}
+				oc.cap = cap
+			})
 		}
 	}
-	return false
+	return guard.(*capabilityOnce).cap
 }
+
+type capabilityOnce struct {
+	once sync.Once
+	cap  map[string]struct{}
+}
+
+// capabilityGuards maps a card to its lazily-built capability set, so the O(n)
+// scan runs once per card regardless of how many goroutines query it.
+var capabilityGuards sync.Map

@@ -8,7 +8,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	afepv1 "github.com/mrschneider/afep/gen/go/afep/v1"
@@ -115,15 +114,13 @@ func VerifyCard(card *afepv1.AgentCard) error {
 // removes ~half of VerifyEnvelope's cost. Keyed on the full marshaled card
 // (not the id) so a re-issued card under the same id is re-verified.
 //
-// Bounded: a federation has far fewer than cardCacheCap distinct cards;
-// on overflow the whole cache is dropped (cheap, and the next verify
-// repopulates it) rather than growing without limit.
+// Bounded LRU: a federation has far fewer than cardCacheCap distinct cards,
+// so the cache rarely evicts. On overflow only the least-recently-used card
+// is dropped (not the whole cache), preserving the hit rate of warm entries
+// instead of a total drop that would thundering-reverify the federation.
 const cardCacheCap = 4096
 
-var (
-	cardCacheMu sync.Mutex
-	cardCache   = make(map[[32]byte]error)
-)
+var cardCache = newLRUCache[[32]byte, error](cardCacheCap)
 
 func cardCacheKey(card *afepv1.AgentCard) ([32]byte, bool) {
 	// The FULL card (body + signature) is the key: the signature covers
@@ -147,21 +144,13 @@ func cardCacheKey(card *afepv1.AgentCard) ([32]byte, bool) {
 func verifyCardCached(card *afepv1.AgentCard) error {
 	key, ok := cardCacheKey(card)
 	if ok {
-		cardCacheMu.Lock()
-		if v, hit := cardCache[key]; hit {
-			cardCacheMu.Unlock()
+		if v, hit := cardCache.get(key); hit {
 			return v
 		}
-		cardCacheMu.Unlock()
 	}
 	err := VerifyCard(card)
 	if ok {
-		cardCacheMu.Lock()
-		if len(cardCache) >= cardCacheCap {
-			cardCache = make(map[[32]byte]error)
-		}
-		cardCache[key] = err
-		cardCacheMu.Unlock()
+		cardCache.put(key, err)
 	}
 	return err
 }

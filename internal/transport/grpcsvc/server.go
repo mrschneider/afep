@@ -328,13 +328,41 @@ func (s *Server) load(id string) (*afepv1.TaskEnvelope, bool) {
 }
 
 func hasCapability(card *afepv1.AgentCard, name string) bool {
-	for _, c := range card.GetCapabilities() {
-		if c.GetName() == name {
-			return true
+	caps := capabilitySet(card.GetId(), card.GetCapabilities())
+	_, ok := caps[name]
+	return ok
+}
+
+// capabilitySet builds an O(1) lookup set from a card's capabilities, memoized
+// per card behind a sync.Once so the O(n) scan runs once. Cards are immutable
+// and shared across goroutines, so this replaces the per-call O(n) linear scan
+// on the hot serve path with a map lookup. Keyed on the card ID (stable and
+// hashable) rather than the card pointer or capabilities slice.
+func capabilitySet(id string, list []*afepv1.Capability) map[string]struct{} {
+	guard, ok := capabilityGuards.Load(id)
+	if !ok {
+		oc := &capabilityOnce{}
+		if guard, ok = capabilityGuards.LoadOrStore(id, oc); !ok {
+			oc.once.Do(func() {
+				cap := make(map[string]struct{}, len(list))
+				for _, capItem := range list {
+					if n := capItem.GetName(); n != "" {
+						cap[n] = struct{}{}
+					}
+				}
+				oc.cap = cap
+			})
 		}
 	}
-	return false
+	return guard.(*capabilityOnce).cap
 }
+
+type capabilityOnce struct {
+	once sync.Once
+	cap  map[string]struct{}
+}
+
+var capabilityGuards sync.Map
 
 func newID() string {
 	var b [16]byte
