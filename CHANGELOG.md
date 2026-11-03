@@ -3,6 +3,35 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.0] — 2026-11-03
+
+### Changed
+
+- **identity: bounded LRU verify caches** — `cardCache` and `envelopeCache`
+  now evict the least-recently-used entry (cap 4096) instead of dropping
+  the whole cache on overflow. A spike of distinct cores/cards evicts one
+  entry rather than thundering-reverify the federation.
+- **mesh: verify-before-revoke** — the issuer signature is checked BEFORE
+  the revocation lookup (ed25519 is ~4 µs on a cache hit), so a poisoned
+  envelope never pays the separate KV round-trip. Revocation still runs
+  after the verify, so a revoked-but-validly-signed issuer is caught.
+- **grpcsvc: O(1) capability lookup** — the per-call O(n) linear scan over
+  a card's capabilities is replaced by a per-card map memoized behind a
+  `sync.Once`, keyed on the stable card id.
+- **identity: clone-free canonical bytes** — `canonicalEnvelopeBytes` builds
+  the signed-core serialization through the reflection API without
+  cloning the envelope; only the 8 core fields are set (proto3 omits zero
+  scalars on the wire), so the output stays byte-identical to the old
+  clone-and-zero path.
+- **identity: LRU unit test** — `internal/identity/lru_test.go` covers
+  eviction order and recency refresh (the `len` helper was previously
+  unreferenced and tripped staticcheck U1000).
+
+### Docs
+CHANGELOG 0.9.0, README Status, ARCHITECTURE LOC table + v-line
+(v0.9.0), SECURITY.md supported-versions row and the mesh verify/revoke
+ordering note.
+
 ## [0.8.0] — 2026-10-31
 
 ### Changed

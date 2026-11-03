@@ -4,8 +4,8 @@
 
 | Version | Supported |
 |---|---|
-| 0.5.x (main) | ✅ current |
-| < 0.5.x | ❌ superseded |
+| 0.9.x (main) | ✅ current |
+| < 0.9.x | ❌ superseded |
 
 Only the latest release receives fixes. Pin the git SHA you deploy.
 
@@ -38,6 +38,10 @@ days; coordinated disclosure by mutual agreement.
   ingress. Issuer signatures are REQUIRED at the mesh consume path
   (`verifyIssuer`: unknown/unverifiable = poison) and at TaskStream
   ingress (`verifyIngressEnvelope`); card revocation is a mirrored KV
-  set (`revoked/<id>`, `-revoke-card` to add) checked before
-  verification, and the gRPC ingress carries a token-bucket rate limit
-  (`-grpc-rate`, default 200 req/s, 0 disables).
+  set (`revoked/<id>`, `-revoke-card` to add), and the gRPC ingress
+  carries a token-bucket rate limit (`-grpc-rate`, default 200 req/s,
+  0 disables). **Ordering**: the mesh path verifies the issuer
+  signature FIRST (a cached ed25519 check, ~4 µs) and only then pays
+  the revocation KV round-trip, so a tampered envelope never reaches
+  the network lookup; the gRPC TaskStream path still checks revocation
+  before signature verification.
