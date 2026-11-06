@@ -22,8 +22,8 @@ type lruCache[K comparable, V any] struct {
 }
 
 type lruNode[K comparable, V any] struct {
-	key K
-	val V
+	key  K
+	val  V
 	prev *lruNode[K, V]
 	next *lruNode[K, V]
 }
