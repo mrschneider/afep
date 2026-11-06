@@ -1,6 +1,6 @@
 # AFEP Architecture
 
-Engineering reference for v0.9.0. Every number here is read from source
+Engineering reference for v0.10.0. Every number here is read from source
 (LOC via `grep -c`, test counts from `grep "func Test"` / `def test_`,
 contracts counted in `proto/afep/v1/`).
 
@@ -148,7 +148,7 @@ by the interop fixtures (Go verification fails when the schema moves).
   (deterministic protobuf), verified in both directions from committed
   fixtures.
 
-## Honest notes / residuals (v0.9.0)
+## Honest notes / residuals (v0.10.0)
 
 - **HTTP/3**: what ships is gRPC over QUIC streams with custom ALPN
   `afep-quic/0.1` — grpc-go has no production HTTP/3 transport yet, so

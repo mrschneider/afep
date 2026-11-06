@@ -3,6 +3,33 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.0] — 2026-11-05
+
+### Changed
+
+- **taskstore: CRC32 integrity on base + delta formats** — both on-disk
+  snapshots now append a CRC32 (IEEE) of the entry payload after the 20-byte
+  header. `decodeV2` and `decodeDelta` verify it at load and fail loudly
+  (`base checksum mismatch` / `delta checksum mismatch`) instead of
+  installing a silently wrong task set. A torn write or bit rot that a
+  previous release would have accepted now aborts boot — fail-closed.
+- **taskstore: bounded worst-case load memory** — the size cap on base load
+  (`maxBaseBytes`, 512 MiB) is now applied *before* allocating the entry
+  map, so a corrupt or hand-edited file that claims millions of entries
+  cannot make us allocate before we reject it.
+- **identity: O(1) LRU** — the slice-based least-recently-used cache is
+  replaced with a doubly-linked list plus a map of node pointers, so
+  `get`/`put`/`evict` are O(1) instead of O(n) slice scans.
+
+### Added
+
+- **taskstore: fuzz target for on-disk snapshots** — `internal/taskstore/fuzz_test.go`
+  feeds arbitrary bytes as the persisted snapshot through `Open` (covering
+  the v1 JSON and v2 base binary shapes, plus raw garbage) and asserts every
+  malformed snapshot is rejected without panicking, and that a store which
+  does open stays usable (Len/Get/Put through the flush path). The v2
+  checksum is part of what a corrupt payload must survive.
+
 ## [0.9.0] — 2026-11-03
 
 ### Changed
