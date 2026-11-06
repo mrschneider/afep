@@ -41,6 +41,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sync"
@@ -84,6 +85,12 @@ const (
 // is guaranteed to hit disk. It coalesces bursts (many puts in one window
 // become one write) while keeping the steady-state durability lag small.
 const defaultFlushInterval = 100 * time.Millisecond
+
+// maxBaseBytes caps the size of the base file read at boot. A corrupt or
+// hand-edited file that claims millions of entries must not make us allocate
+// a map of that size before we can reject it; this bounds worst-case memory
+// on load. Production stores are capped separately by SetMaxTasks.
+const maxBaseBytes = 512 << 20 // 512 MiB
 
 // diskStateV1 is the legacy on-disk format (read-only at boot).
 type diskStateV1 struct {
@@ -463,28 +470,34 @@ func (s *Store) writeDelta(ops []deltaEntry) error {
 }
 
 // encodeV2 renders the base snapshot in the on-disk format (see package
-// doc).
+// doc). A CRC32 of the entry payload (after the 20-byte header) detects
+// silent corruption of the base file: a torn write or bit rot makes load
+// fail loudly instead of installing a silently wrong task set.
 func encodeV2(tasks map[string][]byte) []byte {
-	out := make([]byte, 16, 16+8*len(tasks))
-	copy(out, v2Magic[:])
-	binary.LittleEndian.PutUint32(out[8:12], version)
-	binary.LittleEndian.PutUint32(out[12:16], uint32(len(tasks)))
+	payload := make([]byte, 0, 8*len(tasks))
 	for id, raw := range tasks {
 		var hdr [8]byte
 		binary.LittleEndian.PutUint32(hdr[:4], uint32(len(id)))
 		binary.LittleEndian.PutUint32(hdr[4:], uint32(len(raw)))
-		out = append(out, hdr[:]...)
-		out = append(out, id...)
-		out = append(out, raw...)
+		payload = append(payload, hdr[:]...)
+		payload = append(payload, id...)
+		payload = append(payload, raw...)
 	}
+	out := make([]byte, 20, 20+len(payload))
+	copy(out, v2Magic[:])
+	binary.LittleEndian.PutUint32(out[8:12], version)
+	binary.LittleEndian.PutUint32(out[12:16], uint32(len(tasks)))
+	binary.LittleEndian.PutUint32(out[16:20], crc32.ChecksumIEEE(payload))
+	out = append(out, payload...)
 	return out
 }
 
-// decodeV2 parses the base format with full bounds checking: the fuzz
-// target feeds arbitrary bytes, so a malformed snapshot must fail cleanly,
-// never panic.
+// decodeV2 parses the base format with full bounds checking and a CRC32
+// integrity check: the fuzz target feeds arbitrary bytes, so a malformed
+// snapshot must fail cleanly, never panic. A size cap bounds worst-case
+// allocation on load before the entries can be validated.
 func decodeV2(data []byte) (map[string][]byte, error) {
-	if len(data) < 16 || !bytes.Equal(data[:8], v2Magic[:]) {
+	if len(data) < 20 || !bytes.Equal(data[:8], v2Magic[:]) {
 		return nil, errors.New("bad magic")
 	}
 	if ver := binary.LittleEndian.Uint32(data[8:12]); ver != version {
@@ -492,27 +505,34 @@ func decodeV2(data []byte) (map[string][]byte, error) {
 	}
 	count := binary.LittleEndian.Uint32(data[12:16])
 	// Reject absurd counts up front (8 bytes of header per entry).
-	if count > uint32(len(data)-16)/8 {
+	if count > uint32(len(data)-20)/8 {
 		return nil, errors.New("count exceeds payload")
 	}
+	if uint64(len(data)) > maxBaseBytes {
+		return nil, fmt.Errorf("afep/taskstore: base file too large: %d bytes", len(data))
+	}
+	payload := data[20:]
+	if crc := binary.LittleEndian.Uint32(data[16:20]); crc != crc32.ChecksumIEEE(payload) {
+		return nil, errors.New("base checksum mismatch")
+	}
 	out := make(map[string][]byte, count)
-	pos := 16
+	pos := 0
 	for i := uint32(0); i < count; i++ {
-		if pos+8 > len(data) {
+		if pos+8 > len(payload) {
 			return nil, errors.New("truncated entry header")
 		}
-		idLen := binary.LittleEndian.Uint32(data[pos : pos+4])
-		envLen := binary.LittleEndian.Uint32(data[pos+4 : pos+8])
+		idLen := binary.LittleEndian.Uint32(payload[pos : pos+4])
+		envLen := binary.LittleEndian.Uint32(payload[pos+4 : pos+8])
 		pos += 8
-		if idLen > uint32(len(data)-pos) {
+		if idLen > uint32(len(payload)-pos) {
 			return nil, errors.New("truncated task id")
 		}
-		id := string(data[pos : pos+int(idLen)])
+		id := string(payload[pos : pos+int(idLen)])
 		pos += int(idLen)
-		if envLen > uint32(len(data)-pos) {
+		if envLen > uint32(len(payload)-pos) {
 			return nil, errors.New("truncated task body")
 		}
-		raw := data[pos : pos+int(envLen)]
+		raw := payload[pos : pos+int(envLen)]
 		pos += int(envLen)
 		out[id] = raw
 	}
@@ -521,10 +541,7 @@ func decodeV2(data []byte) (map[string][]byte, error) {
 
 // encodeDelta renders the pending ops in the v3 delta format.
 func encodeDelta(ops []deltaEntry) []byte {
-	out := make([]byte, 16, 16+13*len(ops))
-	copy(out, deltaMagic[:])
-	binary.LittleEndian.PutUint32(out[8:12], deltaVersion)
-	binary.LittleEndian.PutUint32(out[12:16], uint32(len(ops)))
+	payload := make([]byte, 0, 13*len(ops))
 	for _, op := range ops {
 		var hdr [9]byte
 		binary.LittleEndian.PutUint32(hdr[:4], uint32(len(op.id)))
@@ -534,16 +551,22 @@ func encodeDelta(ops []deltaEntry) []byte {
 			hdr[4] = opPut
 			binary.LittleEndian.PutUint32(hdr[5:], uint32(len(op.raw)))
 		}
-		out = append(out, hdr[:]...)
-		out = append(out, op.id...)
-		out = append(out, op.raw...)
+		payload = append(payload, hdr[:]...)
+		payload = append(payload, op.id...)
+		payload = append(payload, op.raw...)
 	}
+	out := make([]byte, 20, 20+len(payload))
+	copy(out, deltaMagic[:])
+	binary.LittleEndian.PutUint32(out[8:12], deltaVersion)
+	binary.LittleEndian.PutUint32(out[12:16], uint32(len(ops)))
+	binary.LittleEndian.PutUint32(out[16:20], crc32.ChecksumIEEE(payload))
+	out = append(out, payload...)
 	return out
 }
 
 // decodeDelta parses the v3 delta format with full bounds checking.
 func decodeDelta(data []byte) ([]deltaEntry, error) {
-	if len(data) < 16 || !bytes.Equal(data[:8], deltaMagic[:]) {
+	if len(data) < 20 || !bytes.Equal(data[:8], deltaMagic[:]) {
 		return nil, errors.New("bad magic")
 	}
 	if ver := binary.LittleEndian.Uint32(data[8:12]); ver != deltaVersion {
@@ -551,28 +574,32 @@ func decodeDelta(data []byte) ([]deltaEntry, error) {
 	}
 	count := binary.LittleEndian.Uint32(data[12:16])
 	// Reject absurd counts up front (9 bytes of header per entry).
-	if count > uint32(len(data)-16)/9 {
+	if count > uint32(len(data)-20)/9 {
 		return nil, errors.New("count exceeds payload")
 	}
+	payload := data[20:]
+	if crc := binary.LittleEndian.Uint32(data[16:20]); crc != crc32.ChecksumIEEE(payload) {
+		return nil, errors.New("delta checksum mismatch")
+	}
 	out := make([]deltaEntry, 0, count)
-	pos := 16
+	pos := 0
 	for i := uint32(0); i < count; i++ {
-		if pos+9 > len(data) {
+		if pos+9 > len(payload) {
 			return nil, errors.New("truncated entry header")
 		}
-		idLen := binary.LittleEndian.Uint32(data[pos : pos+4])
-		opc := data[pos+4]
-		bodyLen := binary.LittleEndian.Uint32(data[pos+5 : pos+9])
+		idLen := binary.LittleEndian.Uint32(payload[pos : pos+4])
+		opc := payload[pos+4]
+		bodyLen := binary.LittleEndian.Uint32(payload[pos+5 : pos+9])
 		pos += 9
-		if idLen > uint32(len(data)-pos) {
+		if idLen > uint32(len(payload)-pos) {
 			return nil, errors.New("truncated task id")
 		}
-		id := string(data[pos : pos+int(idLen)])
+		id := string(payload[pos : pos+int(idLen)])
 		pos += int(idLen)
-		if bodyLen > uint32(len(data)-pos) {
+		if bodyLen > uint32(len(payload)-pos) {
 			return nil, errors.New("truncated entry body")
 		}
-		body := data[pos : pos+int(bodyLen)]
+		body := payload[pos : pos+int(bodyLen)]
 		pos += int(bodyLen)
 		if opc == opTomb {
 			out = append(out, deltaEntry{id: id, tomb: true})

@@ -10,73 +10,90 @@ import "sync"
 // LRU evicts only the least-recently-used entry on overflow, preserving the
 // hit rate of warm entries while keeping memory bounded.
 //
-// The cap is the max number of entries. Lookups refresh recency; writes evict
-// the LRU entry when full. A mutex guards all access.
+// All operations are O(1): a doubly-linked list keeps recency order and the
+// map holds direct pointers to the nodes, so get/moveToEnd/evict never scan
+// the cache. A mutex guards all access.
 type lruCache[K comparable, V any] struct {
 	mu    sync.Mutex
 	cap   int
-	order []K
-	items map[K]V
+	items map[K]*lruNode[K, V]
+	head  *lruNode[K, V] // sentinel: item after head is MRU
+	tail  *lruNode[K, V] // sentinel: item before tail is LRU
+}
+
+type lruNode[K comparable, V any] struct {
+	key K
+	val V
+	prev *lruNode[K, V]
+	next *lruNode[K, V]
 }
 
 func newLRUCache[K comparable, V any](cap int) *lruCache[K, V] {
 	if cap < 1 {
 		cap = 1
 	}
-	return &lruCache[K, V]{cap: cap, items: make(map[K]V)}
+	c := &lruCache[K, V]{cap: cap, items: make(map[K]*lruNode[K, V])}
+	// Wire the two sentinels together so the list is empty.
+	c.head = &lruNode[K, V]{}
+	c.tail = &lruNode[K, V]{}
+	c.head.next = c.tail
+	c.tail.prev = c.head
+	return c
+}
+
+// insertMRU places node right after the head sentinel (most-recently-used).
+func (c *lruCache[K, V]) insertMRU(n *lruNode[K, V]) {
+	n.prev = c.head
+	n.next = c.head.next
+	c.head.next.prev = n
+	c.head.next = n
+}
+
+// remove detaches a node from the list regardless of its position.
+func (c *lruCache[K, V]) remove(n *lruNode[K, V]) {
+	n.prev.next = n.next
+	n.next.prev = n.prev
+	n.prev = nil
+	n.next = nil
 }
 
 // get returns the value for key and marks it most-recently-used.
 func (c *lruCache[K, V]) get(key K) (V, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	v, ok := c.items[key]
+	n, ok := c.items[key]
 	if !ok {
 		var zero V
 		return zero, false
 	}
-	c.moveToEnd(key)
-	return v, true
+	c.remove(n)
+	c.insertMRU(n)
+	return n.val, true
 }
 
 // put inserts or updates key, marking it most-recently-used and evicting the
-// LRU entry if the cache is at capacity.
+// LRU entry (the node just before tail) if the cache is at capacity.
 func (c *lruCache[K, V]) put(key K, v V) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.items[key]; ok {
-		c.items[key] = v
-		c.moveToEnd(key)
+	if n, ok := c.items[key]; ok {
+		n.val = v
+		c.remove(n)
+		c.insertMRU(n)
 		return
 	}
 	if len(c.items) >= c.cap {
-		c.evictLRU()
-	}
-	c.items[key] = v
-	c.order = append(c.order, key)
-}
-
-// moveToEnd marks key as most-recently-used in the order slice.
-func (c *lruCache[K, V]) moveToEnd(key K) {
-	for i := len(c.order) - 1; i >= 0; i-- {
-		if c.order[i] == key {
-			if i != len(c.order)-1 {
-				c.order = append(c.order[:i], c.order[i+1:]...)
-				c.order = append(c.order, key)
-			}
+		lru := c.tail.prev
+		if lru == c.head {
+			c.mu.Unlock()
 			return
 		}
+		c.remove(lru)
+		delete(c.items, lru.key)
 	}
-}
-
-// evictLRU removes the least-recently-used entry.
-func (c *lruCache[K, V]) evictLRU() {
-	if len(c.order) == 0 {
-		return
-	}
-	oldest := c.order[0]
-	c.order = c.order[1:]
-	delete(c.items, oldest)
+	n := &lruNode[K, V]{key: key, val: v}
+	c.items[key] = n
+	c.insertMRU(n)
 }
 
 // len returns the number of entries (for tests).
