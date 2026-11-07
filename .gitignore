@@ -6,3 +6,4 @@ coverage.out
 __pycache__/
 *.pyc
 *.egg-info/
+*.test

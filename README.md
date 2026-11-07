@@ -172,6 +172,6 @@ docs/SPEC.md                  normative protocol specification
 
 ## Status
 
-v0.10.0 — experimental. Integrity round: CRC32 on base+delta taskstore formats (fail-loud on torn write / bit rot), O(1) linked-list LRU verify caches, bounded LRU verify caches, O(1) capability lookup, verify-before-revoke, shared QUIC dials, async NATS bid archive. All v0.1.0 gaps are closed; the current honest
+v0.10.1 — experimental. Integrity round: CRC32 on base+delta taskstore formats (fail-loud on torn write / bit rot), O(1) linked-list LRU verify caches, bounded LRU verify caches, O(1) capability lookup, verify-before-revoke, shared QUIC dials, async NATS bid archive. All v0.1.0 gaps are closed; the current honest
 residuals live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 License: MIT.

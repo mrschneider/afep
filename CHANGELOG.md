@@ -3,6 +3,19 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.1] — 2026-11-06
+
+### Changed
+
+- **identity: faster `canonicalEnvelopeBytes`** — the canonical serialization
+  used to build the cache key for the verify cache is now written directly from
+  the concrete `EnvelopeBody` fields instead of `proto.Clone` + descriptor
+  reflection walk + `protoreflect.Value` per field. Wire bytes are identical
+  (proto3 omits zero scalars, so the cache key is unchanged — conformance
+  vectors still pass). On the reference host (Intel N100) `BenchmarkEnvelopeBody`
+  dropped from ~1930 ns/op / 16 allocs to ~535 ns/op / 3 allocs, and
+  `BenchmarkVerifyEnvelope` from ~4 µs to ~1.37 µs.
+
 ## [0.10.0] — 2026-11-05
 
 ### Changed
