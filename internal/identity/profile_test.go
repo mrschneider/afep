@@ -10,10 +10,10 @@ func profEnv() *afepv1.TaskEnvelope {
 	return &afepv1.TaskEnvelope{
 		TaskId: "bench-task", RootTaskId: "bench-task", Tenant: "tenant:bench",
 		IssuerAgent: "tenant/bench", Capability: "bench.cap",
-		Payload: []byte("benchmark payload data"),
+		Payload:     []byte("benchmark payload data"),
 		PayloadType: "application/x-afep-bench",
-		Deadline: &afepv1.Deadline{StartUnix: 1700000000, ExpiresUnix: 1700003600},
-		Hops: 3, State: afepv1.TaskState_TASK_STATE_PROBE,
+		Deadline:    &afepv1.Deadline{StartUnix: 1700000000, ExpiresUnix: 1700003600},
+		Hops:        3, State: afepv1.TaskState_TASK_STATE_PROBE,
 	}
 }
 
