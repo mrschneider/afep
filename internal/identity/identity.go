@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	afepv1 "github.com/mrschneider/afep/gen/go/afep/v1"
@@ -122,20 +123,40 @@ const cardCacheCap = 4096
 
 var cardCache = newLRUCache[[32]byte, error](cardCacheCap)
 
+// cardDigestCache memoizes cardCacheKey per card POINTER. AgentCards are
+// immutable self-signed artifacts that are shared across goroutines (the
+// bus mirrors the KV bucket into one cardCache entry; the mesh re-uses the
+// same pointer for every envelope from that issuer), so the digest of a
+// card's bytes is stable for the pointer's whole life. Keying on the
+// pointer — not the bytes — turns the per-envelope warm-cache verify path
+// from "deterministic marshal + sha256 of the card" into a single map
+// lookup: the envelope path then pays only envelopeCacheKey + LRU lookups.
+//
+// The map grows one entry per distinct card object (a few dozen to a few
+// thousand in a federation — the same bound that keeps cardCache warm);
+// each entry is a pointer + [32]byte, and the objects it pins are the
+// cards already alive in the bus cache / issuer resolver, so the extra
+// retention is bounded by the federation's card count, not its traffic.
+var cardDigestCache sync.Map // *afepv1.AgentCard -> cardDigest
+
+type cardDigest struct {
+	key [32]byte
+	ok  bool
+}
+
 func cardCacheKey(card *afepv1.AgentCard) ([32]byte, bool) {
-	// The FULL card (body + signature) is the key: the signature covers
-	// the body minus the signature field, so two artifacts sharing
-	// (id, pubkey, signature) but differing in body are distinct — and
-	// only one can be valid. Keying on anything less would let a
-	// tampered body ride a valid card's cached result. A deterministic
-	// marshal makes equal cards digest equal; the sha256 of the bytes
-	// is the map key (collision-safe at 256 bits, and it is the digest
-	// of the exact signed artifact, not a field projection).
+	if d, ok := cardDigestCache.Load(card); ok {
+		cd := d.(cardDigest)
+		return cd.key, cd.ok
+	}
 	body, err := proto.MarshalOptions{Deterministic: true}.Marshal(card)
 	if err != nil {
+		cardDigestCache.Store(card, cardDigest{ok: false})
 		return [32]byte{}, false // unmarshalable: never cache, always verify
 	}
-	return sha256.Sum256(body), true
+	cd := cardDigest{key: sha256.Sum256(body), ok: true}
+	cardDigestCache.Store(card, cd)
+	return cd.key, cd.ok
 }
 
 // verifyCardCached is VerifyCard with a memoization layer. The cache stores

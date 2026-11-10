@@ -40,8 +40,11 @@ type Bus struct {
 	kv  jetstream.KeyValue
 	kvL sync.RWMutex
 	// cardCache mirrors the KV bucket fed by WatchAll: issuer lookups
-	// on the per-envelope verify path read it with zero RTT.
-	cardCache map[string][]byte
+	// on the per-envelope verify path read it with zero RTT. It holds the
+	// UNMARSHALED card, not the raw bytes: GetCard then returns a stable
+	// pointer, so the identity layer's pointer-keyed card-digest cache hits
+	// on every envelope and a re-unmarshal per verify disappears too.
+	cardCache map[string]*afepv1.AgentCard
 	kvStop    context.CancelFunc
 	// statsCons (set at subscribe) feeds the observability ticker.
 	statsCons jetstream.Consumer
@@ -143,7 +146,7 @@ func Dial(ctx context.Context, url string, extra ...nats.Option) (*Bus, error) {
 	}
 	b = &Bus{
 		nc: nc, js: js, kv: kv,
-		cardCache:    make(map[string][]byte),
+		cardCache:    make(map[string]*afepv1.AgentCard),
 		revokedCache: make(map[string]bool),
 		bidArchiveCh: make(chan *nats.Msg, 1024),
 	}
@@ -254,7 +257,17 @@ func (b *Bus) startCardWatcher(ctx context.Context) {
 				if revoked {
 					b.revokedCache[key] = true
 				} else {
-					b.cardCache[key] = append([]byte(nil), entry.Value()...)
+					// Unmarshal ONCE here (watch event) instead of per
+					// GetCard (envelope verify): the stored pointer is
+					// stable, which is what makes the identity layer's
+					// pointer-keyed digest cache hit on every envelope.
+					card := &afepv1.AgentCard{}
+					if uerr := proto.Unmarshal(entry.Value(), card); uerr != nil {
+						log.Printf("natsbus: card watch: unmarshal %q: %v", key, uerr)
+						b.kvL.Unlock()
+						continue
+					}
+					b.cardCache[key] = card
 				}
 				b.kvL.Unlock()
 			}
@@ -617,36 +630,53 @@ func (b *Bus) PutCard(ctx context.Context, card *afepv1.AgentCard) error {
 	if _, err := b.kv.Put(ctx, card.GetId(), body); err != nil {
 		return fmt.Errorf("afep/natsbus: kv put: %w", err)
 	}
-	// instant mirror hit; the watcher will confirm the same bytes
+	// instant mirror hit; the watcher will confirm the same bytes.
+	// Store the SAME pointer the caller signed (a card is an immutable
+	// self-signed artifact), so the verify path re-uses it directly.
 	b.kvL.Lock()
-	b.cardCache[card.GetId()] = body
+	b.cardCache[card.GetId()] = card
 	b.kvL.Unlock()
 	return nil
 }
 
-// GetCard loads a card from KV; ok is false when absent.
+// GetCard loads a card from KV; ok is false when absent. The returned
+// pointer is STABLE across calls for the same id: the mirror is built by
+// the watcher (one unmarshal per card event) and this only falls back to
+// an authoritative read when the mirror misses, so the identity layer's
+// pointer-keyed digest cache — and the caller's own re-use of the card —
+// both hit without re-parsing the bytes.
 func (b *Bus) GetCard(ctx context.Context, id string) (*afepv1.AgentCard, bool, error) {
 	if b.kv == nil {
 		return nil, false, errors.New("afep/natsbus: kv not initialized")
 	}
 	b.kvL.RLock()
-	raw, hit := b.cardCache[id]
+	card, hit := b.cardCache[id]
 	b.kvL.RUnlock()
-	if !hit {
-		// watch missed it (cold start / rotation): authoritative read
-		entry, err := b.kv.Get(ctx, id)
-		if err != nil {
-			if err == jetstream.ErrKeyNotFound {
-				return nil, false, nil
-			}
-			return nil, false, fmt.Errorf("afep/natsbus: kv get: %w", err)
-		}
-		raw = entry.Value()
+	if hit {
+		return card, true, nil
 	}
-	card := &afepv1.AgentCard{}
-	if err := proto.Unmarshal(raw, card); err != nil {
+	// watch missed it (cold start / rotation): authoritative read
+	entry, err := b.kv.Get(ctx, id)
+	if err != nil {
+		if err == jetstream.ErrKeyNotFound {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("afep/natsbus: kv get: %w", err)
+	}
+	card = &afepv1.AgentCard{}
+	if err := proto.Unmarshal(entry.Value(), card); err != nil {
 		return nil, false, fmt.Errorf("afep/natsbus: unmarshal: %w", err)
 	}
+	// Publish the unmarshaled pointer so the NEXT GetCard (and the digest
+	// cache) hit; a concurrent watcher write for the same key simply
+	// replaces it with an equal card.
+	b.kvL.Lock()
+	if cur, ok := b.cardCache[id]; ok {
+		b.kvL.Unlock()
+		return cur, true, nil
+	}
+	b.cardCache[id] = card
+	b.kvL.Unlock()
 	return card, true, nil
 }
 
