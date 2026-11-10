@@ -16,10 +16,14 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Install buf and codegen plugins
+        # Pinned to match the versions embedded in gen/ headers. @latest broke
+        # CI when buf v1.75.0 raised its `go` directive to 1.26.7 while
+        # go.mod/setup-go pin go 1.26.0 (buf install then fails outright).
+        # Bump these together with a go.mod go-version bump.
         run: |
-          go install github.com/bufbuild/buf/cmd/buf@latest
-          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+          go install github.com/bufbuild/buf/cmd/buf@v1.72.0
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
       - name: buf lint
         run: buf lint
       - name: buf breaking (vs previous commit)
