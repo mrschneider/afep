@@ -3,6 +3,25 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.2] — 2026-11-10
+
+### Changed
+
+- **identity: stable card pointer → per-envelope verify is O(1) again** —
+  `bus.GetCard` used to `proto.Unmarshal` a fresh `*afepv1.AgentCard` on
+  every envelope verify. Because the identity layer's card-digest cache is
+  keyed on the pointer, a new pointer per envelope meant the cache never
+  hit and grew one entry per envelope (unbounded). The NATS bus now mirrors
+  the KV bucket as the *unmarshaled* card (one `proto.Unmarshal` per watch
+  event in `startCardWatcher`), `GetCard` returns that same stable pointer
+  on a mirror hit (authoritative KV read only on a cold-start/rotation
+  miss, publishing the pointer back), and `PutCard` stores the exact pointer
+  the caller signed. `cardCacheKey` now memoizes the sha256 digest per card
+  pointer (`cardDigestCache`), so the warm verify path pays a single map
+  lookup instead of a deterministic marshal + sha256. The digest map is
+  bounded by the federation's card count, not its traffic. Also drops the
+  dangling `verifyCardCached` stub.
+
 ## [0.10.1] — 2026-11-06
 
 ### Changed
