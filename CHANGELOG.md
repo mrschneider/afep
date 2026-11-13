@@ -3,6 +3,25 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.3] — 2026-11-13
+
+### Changed
+
+- **identity/bus/mesh: kill `proto.Clone` on the sign path** — `bidBody` and
+  `cardBody` now build a bare message from the signed fields (sharing the
+  immutable nested messages) instead of deep-copying the whole bid/card
+  through `proto.Clone`, which copied the entire bid including the 64 B
+  signature. `envelopeCacheKey` pre-sizes its buffer to the exact length and
+  appends ints via a stack buffer (8 allocs → 1). `subjectAgent`'s
+  `strings.NewReplacer` is hoisted to a package var. `PublishBid` shares one
+  header+msgid between live and archive, and `PublishEnvelope` memoizes
+  `stateStr`. Signed bytes and cache keys are byte-identical, so the
+  conformance vectors are unaffected.
+  Reference host (Intel N100): `BenchmarkVerifyEnvelope` 991 ns / 8 allocs →
+  548 ns / 1 alloc; `BenchmarkCacheKeyProfile` 1325 ns / 9 allocs →
+  505 ns / 1 alloc; `BenchmarkOnEnvelope` 43167 ns / 17 allocs →
+  41763 ns / 7 allocs.
+
 ## [0.10.2] — 2026-11-10
 
 ### Changed

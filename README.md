@@ -172,6 +172,11 @@ docs/SPEC.md                  normative protocol specification
 
 ## Status
 
-v0.10.2 — experimental. Performance round: stable card pointer from the NATS bus mirror so per-envelope verify hits the pointer-keyed digest cache (one unmarshal per card event, not per envelope) and the card-digest map is bounded by card count, not traffic. All v0.1.0 gaps are closed; the current honest
+v0.10.3 — experimental. Performance round: the sign path no longer deep-copies
+(`proto.Clone` gone from `bidBody`/`cardBody`), the verify cache key is
+pre-sized in one allocation, and the NATS bus mirror keeps per-envelope verify
+on a pointer-keyed digest cache (one unmarshal per card event, not per
+envelope). `BenchmarkVerifyEnvelope` is ~45% faster and `BenchmarkOnEnvelope`
+halves its allocations. All v0.1.0 gaps are closed; the current honest
 residuals live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 License: MIT.
