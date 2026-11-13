@@ -61,10 +61,23 @@ func NewCard(id, displayName string, kp *KeyPair, mutate func(*afepv1.AgentCard)
 }
 
 // cardBody is the deterministic serialization covered by the signature:
-// the card with the signature field cleared.
+// the card with the signature field cleared. It builds a bare AgentCard
+// sharing the (immutable) nested messages instead of deep-cloning them:
+// proto.Marshal is read-only, so sharing Endpoint, Capabilities and
+// Metadata is safe. This cuts the clone cost from O(card size) to a single
+// struct allocation.
 func cardBody(card *afepv1.AgentCard) ([]byte, error) {
-	c := proto.Clone(card).(*afepv1.AgentCard)
-	c.Signature = nil
+	c := &afepv1.AgentCard{
+		Id:                 card.Id,
+		DisplayName:        card.DisplayName,
+		PublicKey:          card.PublicKey,
+		Endpoint:           card.Endpoint,
+		Capabilities:       card.Capabilities,
+		SecurityClearances: card.SecurityClearances,
+		Metadata:           card.Metadata,
+		IssuedAtUnix:       card.IssuedAtUnix,
+		ExpiresAtUnix:      card.ExpiresAtUnix,
+	}
 	return proto.MarshalOptions{Deterministic: true}.Marshal(c)
 }
 

@@ -158,9 +158,31 @@ func appendLPS(b []byte, s string) []byte {
 	return append(append(b, p[:]...), s...)
 }
 
-// envelopeCacheKey fingerprints (core fields, public key, signature).
+// appendLPInt64 writes a u32le length prefix followed by v in base 10,
+// using a stack buffer for the digits so no heap allocation is made for the
+// int encoding (strconv.AppendInt(nil, ...) would allocate on every call).
+func appendLPInt64(b []byte, v int64) []byte {
+	var num [20]byte
+	s := strconv.AppendInt(num[:0], v, 10)
+	var p [4]byte
+	binary.LittleEndian.PutUint32(p[:], uint32(len(s)))
+	b = append(b, p[:]...)
+	return append(b, s...)
+}
+
+// envelopeCacheKey fingerprints (core fields, public key, signature). The
+// buffer is pre-sized to the exact output length (int64 fields are bounded by
+// 20 base-10 digits) so the appends below grow it at most once — this cuts
+// the ~9 growing-appends of the old version to a single allocation, while
+// producing byte-identical input to sha256 (same fields, same length
+// prefixes, same base-10 int encoding), so cached keys are unchanged.
 func envelopeCacheKey(env *afepv1.TaskEnvelope, pub, sig []byte) [32]byte {
-	var buf []byte
+	d := env.GetDeadline()
+	n := 4*11 +
+		len(env.TaskId) + len(env.RootTaskId) + len(env.Tenant) +
+		len(env.IssuerAgent) + len(env.Capability) + len(env.PayloadType) +
+		len(env.Payload) + len(pub) + len(sig) + 40
+	buf := make([]byte, 0, n)
 	buf = appendLPS(buf, env.TaskId)
 	buf = appendLPS(buf, env.RootTaskId)
 	buf = appendLPS(buf, env.Tenant)
@@ -168,9 +190,8 @@ func envelopeCacheKey(env *afepv1.TaskEnvelope, pub, sig []byte) [32]byte {
 	buf = appendLPS(buf, env.Capability)
 	buf = appendLPS(buf, env.PayloadType)
 	buf = appendLP(buf, env.Payload)
-	d := env.GetDeadline()
-	buf = appendLP(buf, strconv.AppendInt(nil, d.GetStartUnix(), 10))
-	buf = appendLP(buf, strconv.AppendInt(nil, d.GetExpiresUnix(), 10))
+	buf = appendLPInt64(buf, d.GetStartUnix())
+	buf = appendLPInt64(buf, d.GetExpiresUnix())
 	buf = appendLP(buf, pub)
 	buf = appendLP(buf, sig)
 	return sha256.Sum256(buf)

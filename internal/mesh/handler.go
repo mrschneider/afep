@@ -211,9 +211,13 @@ func (h *Handler) publishBid(env *afepv1.TaskEnvelope) error {
 	return nil
 }
 
+// subjectReplacer maps a card id ("tenant/agent") onto one subject segment.
+// Package-level so it is built once, not allocated per call.
+var subjectReplacer = strings.NewReplacer("/", "-", " ", "-", "\\", "-")
+
 // subjectAgent maps a card id ("tenant/agent") onto one subject segment.
 func subjectAgent(id string) string {
-	return strings.NewReplacer("/", "-", " ", "-", "\\", "-").Replace(id)
+	return subjectReplacer.Replace(id)
 }
 
 func hasCapability(card *afepv1.AgentCard, name string) bool {

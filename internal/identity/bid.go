@@ -10,11 +10,21 @@ import (
 )
 
 // bidBody is the deterministic serialization covered by a bid signature:
-// the bid with the signature field cleared.
+// the bid with the signature field cleared. It builds a bare Bid with only
+// the signed fields (agent_id, score, rationale, proposed_deadline_unix,
+// task_id) so the wire bytes are identical to a proto.Clone + clear-signature
+// + deterministic-marshal, while skipping the deep copy of the (potentially
+// large) signature bytes. proto3 omits zero-valued fields, so a nil
+// signature is simply absent from the output.
 func bidBody(bid *afepv1.Bid) ([]byte, error) {
-	b := proto.Clone(bid).(*afepv1.Bid)
-	b.Signature = nil
-	return proto.MarshalOptions{Deterministic: true}.Marshal(b)
+	out := &afepv1.Bid{
+		AgentId:              bid.AgentId,
+		Score:                bid.Score,
+		Rationale:            bid.Rationale,
+		ProposedDeadlineUnix: bid.ProposedDeadlineUnix,
+		TaskId:               bid.TaskId,
+	}
+	return proto.MarshalOptions{Deterministic: true}.Marshal(out)
 }
 
 // SignBid signs bid in place with kp; the caller must have stamped

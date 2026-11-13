@@ -404,6 +404,7 @@ func (b *Bus) PublishEnvelope(ctx context.Context, domain, agent string, env *af
 	if err != nil {
 		return fmt.Errorf("afep/natsbus: marshal: %w", err)
 	}
+	stateStr := env.GetState().String()
 	msg := nats.NewMsg(subject)
 	if msg.Header == nil {
 		msg.Header = make(nats.Header)
@@ -413,8 +414,8 @@ func (b *Bus) PublishEnvelope(ctx context.Context, domain, agent string, env *af
 	// share the task id, and JetStream de-dups MsgId stream-wide (a plain
 	// task id would silently swallow the escalation as a "duplicate").
 	msg.Header.Set(nats.MsgIdHdr,
-		env.GetTaskId()+":"+env.GetState().String()+":"+strconv.FormatUint(uint64(env.GetHops()), 10))
-	msg.Header.Set("AFEP-State", env.GetState().String())
+		env.GetTaskId()+":"+stateStr+":"+strconv.FormatUint(uint64(env.GetHops()), 10))
+	msg.Header.Set("AFEP-State", stateStr)
 	if _, err := b.js.PublishMsg(ctx, msg); err != nil {
 		return fmt.Errorf("afep/natsbus: publish: %w", err)
 	}
@@ -691,8 +692,10 @@ func (b *Bus) PublishBid(domain, agent string, bid *afepv1.Bid) error {
 	if err != nil {
 		return fmt.Errorf("afep/natsbus: marshal bid: %w", err)
 	}
-	msg := &nats.Msg{Subject: subject, Data: body, Header: make(nats.Header)}
-	msg.Header.Set(nats.MsgIdHdr, bid.GetTaskId()+":"+bid.GetAgentId())
+	// Compute the dedup key once; the live and archive messages share it.
+	msgId := bid.GetTaskId() + ":" + bid.GetAgentId()
+	header := nats.Header{nats.MsgIdHdr: []string{msgId}}
+	msg := &nats.Msg{Subject: subject, Data: body, Header: header}
 	if err := b.nc.PublishMsg(msg); err != nil {
 		return fmt.Errorf("afep/natsbus: publish bid: %w", err)
 	}
@@ -702,8 +705,9 @@ func (b *Bus) PublishBid(domain, agent string, bid *afepv1.Bid) error {
 	// Enqueued for the background worker — the bid must not pay a
 	// JetStream roundtrip on the hot path. A full queue drops the
 	// archive (counted); the live bid is never blocked by it.
-	am := &nats.Msg{Subject: subject, Data: body, Header: make(nats.Header)}
-	am.Header.Set(nats.MsgIdHdr, bid.GetTaskId()+":"+bid.GetAgentId())
+	// The archive message reuses the live message's header map (read-only
+	// from here on) to save one allocation per bid.
+	am := &nats.Msg{Subject: subject, Data: body, Header: header}
 	select {
 	case b.bidArchiveCh <- am:
 	default:
