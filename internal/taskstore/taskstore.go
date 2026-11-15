@@ -473,22 +473,33 @@ func (s *Store) writeDelta(ops []deltaEntry) error {
 // doc). A CRC32 of the entry payload (after the 20-byte header) detects
 // silent corruption of the base file: a torn write or bit rot makes load
 // fail loudly instead of installing a silently wrong task set.
+//
+// The output buffer is allocated ONCE at the exact final size (20-byte
+// header + every entry) and the entries are written directly into it. The
+// old version grew a separate payload slice and then copied it into a
+// second buffer — two large allocations plus a full O(N) copy per
+// compaction. Writing in place halves the compaction allocation and removes
+// the copy (and the GC scan of the now-nonexistent intermediate buffer).
 func encodeV2(tasks map[string][]byte) []byte {
-	payload := make([]byte, 0, 8*len(tasks))
+	total := 20
+	for id, raw := range tasks {
+		total += 8 + len(id) + len(raw)
+	}
+	out := make([]byte, total)
+	copy(out, v2Magic[:])
+	binary.LittleEndian.PutUint32(out[8:12], version)
+	binary.LittleEndian.PutUint32(out[12:16], uint32(len(tasks)))
+	pos := 20
 	for id, raw := range tasks {
 		var hdr [8]byte
 		binary.LittleEndian.PutUint32(hdr[:4], uint32(len(id)))
 		binary.LittleEndian.PutUint32(hdr[4:], uint32(len(raw)))
-		payload = append(payload, hdr[:]...)
-		payload = append(payload, id...)
-		payload = append(payload, raw...)
+		copy(out[pos:], hdr[:])
+		pos += 8
+		pos += copy(out[pos:], id)
+		pos += copy(out[pos:], raw)
 	}
-	out := make([]byte, 20, 20+len(payload))
-	copy(out, v2Magic[:])
-	binary.LittleEndian.PutUint32(out[8:12], version)
-	binary.LittleEndian.PutUint32(out[12:16], uint32(len(tasks)))
-	binary.LittleEndian.PutUint32(out[16:20], crc32.ChecksumIEEE(payload))
-	out = append(out, payload...)
+	binary.LittleEndian.PutUint32(out[16:20], crc32.ChecksumIEEE(out[20:]))
 	return out
 }
 
@@ -540,8 +551,23 @@ func decodeV2(data []byte) (map[string][]byte, error) {
 }
 
 // encodeDelta renders the pending ops in the v3 delta format.
+//
+// Like encodeV2, the output buffer is allocated once at the exact final
+// size and the ops are written directly into it — no intermediate payload
+// slice, no O(N) copy. The delta is rewritten on EVERY flush (not just
+// compaction), so this is the hottest allocation in the store's write path;
+// the old two-buffer version dominated alloc_space in the flush benchmarks
+// and pulled GC scan time up with it.
 func encodeDelta(ops []deltaEntry) []byte {
-	payload := make([]byte, 0, 13*len(ops))
+	total := 20
+	for _, op := range ops {
+		total += 9 + len(op.id) + len(op.raw)
+	}
+	out := make([]byte, total)
+	copy(out, deltaMagic[:])
+	binary.LittleEndian.PutUint32(out[8:12], deltaVersion)
+	binary.LittleEndian.PutUint32(out[12:16], uint32(len(ops)))
+	pos := 20
 	for _, op := range ops {
 		var hdr [9]byte
 		binary.LittleEndian.PutUint32(hdr[:4], uint32(len(op.id)))
@@ -551,16 +577,12 @@ func encodeDelta(ops []deltaEntry) []byte {
 			hdr[4] = opPut
 			binary.LittleEndian.PutUint32(hdr[5:], uint32(len(op.raw)))
 		}
-		payload = append(payload, hdr[:]...)
-		payload = append(payload, op.id...)
-		payload = append(payload, op.raw...)
+		copy(out[pos:], hdr[:])
+		pos += 9
+		pos += copy(out[pos:], op.id)
+		pos += copy(out[pos:], op.raw)
 	}
-	out := make([]byte, 20, 20+len(payload))
-	copy(out, deltaMagic[:])
-	binary.LittleEndian.PutUint32(out[8:12], deltaVersion)
-	binary.LittleEndian.PutUint32(out[12:16], uint32(len(ops)))
-	binary.LittleEndian.PutUint32(out[16:20], crc32.ChecksumIEEE(payload))
-	out = append(out, payload...)
+	binary.LittleEndian.PutUint32(out[16:20], crc32.ChecksumIEEE(out[20:]))
 	return out
 }
 
