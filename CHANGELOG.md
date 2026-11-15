@@ -3,6 +3,23 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.4] — 2026-11-15
+
+### Changed
+
+- **taskstore: single-buffer `encodeDelta`/`encodeV2` kills the O(N) copy** —
+  both encoders grew a separate `payload` slice with `append` and then copied
+  it into a second buffer: two large allocations plus a full O(N) copy per
+  encode. Because the delta is rewritten on **every flush** (not just
+  compaction), the intermediate buffer dominated `alloc_space` in the flush
+  benchmarks and pulled GC scan time up with it. The encoders now compute the
+  exact final size (20-byte header + every entry) and write directly into one
+  buffer; the CRC32 is computed in place over `out[20:]`. Output bytes are
+  unchanged (same header layout, same CRC input), so stored files and
+  conformance vectors are unaffected. Reference host (Intel N100):
+  `BenchmarkDeltaFlush10k` 470010 ns / 397601 B / 32 allocs → ~250000 ns /
+  ~156000 B / 28 allocs (−47% time, −61% space).
+
 ## [0.10.3] — 2026-11-13
 
 ### Changed

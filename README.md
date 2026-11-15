@@ -172,11 +172,13 @@ docs/SPEC.md                  normative protocol specification
 
 ## Status
 
-v0.10.3 — experimental. Performance round: the sign path no longer deep-copies
-(`proto.Clone` gone from `bidBody`/`cardBody`), the verify cache key is
-pre-sized in one allocation, and the NATS bus mirror keeps per-envelope verify
-on a pointer-keyed digest cache (one unmarshal per card event, not per
-envelope). `BenchmarkVerifyEnvelope` is ~45% faster and `BenchmarkOnEnvelope`
-halves its allocations. All v0.1.0 gaps are closed; the current honest
+v0.10.4 — experimental. Performance round, continued: the taskstore delta
+encoder now allocates a single buffer at the exact final size (the two-buffer
+`append`-then-copy is gone from `encodeDelta`/`encodeV2`), cutting the hot
+flush path ~47% in time and ~61% in allocation space
+(`BenchmarkDeltaFlush10k` 470 µs / 398 KB / 32 allocs → ~250 µs / ~156 KB /
+28 allocs on the reference Intel N100). Output bytes are unchanged, so stored
+files and conformance vectors are unaffected. On top of the v0.10.3 sign-path
+and verify-cache work, all v0.1.0 gaps remain closed; the current honest
 residuals live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 License: MIT.
