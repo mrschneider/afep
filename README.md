@@ -172,13 +172,15 @@ docs/SPEC.md                  normative protocol specification
 
 ## Status
 
-v0.10.4 — experimental. Performance round, continued: the taskstore delta
-encoder now allocates a single buffer at the exact final size (the two-buffer
-`append`-then-copy is gone from `encodeDelta`/`encodeV2`), cutting the hot
-flush path ~47% in time and ~61% in allocation space
-(`BenchmarkDeltaFlush10k` 470 µs / 398 KB / 32 allocs → ~250 µs / ~156 KB /
-28 allocs on the reference Intel N100). Output bytes are unchanged, so stored
-files and conformance vectors are unaffected. On top of the v0.10.3 sign-path
-and verify-cache work, all v0.1.0 gaps remain closed; the current honest
-residuals live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+v0.10.5 — experimental. Performance round, continued: the pprof profile
+showed 90%+ of per-envelope cost is ed25519 sign/verify (inherent to the
+protocol, already amortized by the verify caches), so this round cuts the
+surrounding plumbing — `taskstore.Put` now clones/marshals **outside** the
+write lock (concurrent Puts parallelize the copy/encode: `BenchmarkPutConcurrent-4`
+10088 → 4770 ns/op, −53%), `lifecycle.Can` is a single bitmask probe instead
+of a slice scan on every `Apply`, and `clearance.Holds` compiles each card's
+grants once per pointer into an exact set + prefix list (O(1) serve checks).
+On top of the v0.10.4 delta-encoder, v0.10.3 sign-path and verify-cache work,
+all v0.1.0 gaps remain closed; the current honest residuals live in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 License: MIT.

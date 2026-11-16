@@ -3,6 +3,38 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.5] — 2026-11-15
+
+### Changed
+
+- **taskstore/lifecycle/clearance: three hot-path cuts from the pprof profile** —
+  the profile confirmed 90%+ of per-envelope cost is ed25519 sign/verify
+  (inherent to the protocol, already amortized by the verify caches); the
+  attackable waste was in the surrounding plumbing:
+  - `taskstore.Put`: `proto.Clone` + `proto.Marshal` are O(envelope size) and
+    pure functions of the argument (they read no store state), so they now
+    run **outside** the write lock; the lock is held only for the three O(1)
+    map inserts. Concurrent Puts (gRPC streams, mesh workers) no longer
+    serialize the copy/encode work. The `maxTasks` guard moved inside the
+    lock so the bound is still checked against current state.
+  - `lifecycle.Can`: the per-source-state slice scan became a `[8]uint8`
+    bitmask (the enum is dense 0..7), so `Can` is a single AND+shift with no
+    allocation on the per-envelope `Apply` path. The masks are the exact
+    encoding of the previous table.
+  - `clearance.Holds`: `HasSuffix`/`TrimSuffix`/`HasPrefix` were re-run over
+    the raw grant list on every serve check. Clearances are now compiled once
+    per card pointer (`sync.Map`, same idiom as the identity card-digest
+    cache) into an exact set + prefix list, so a check is an O(1) set probe
+    plus a short prefix scan. Keying on the pointer stays correct when a card
+    id is reused with different grants.
+
+  Reference host (Intel N100): `BenchmarkPutConcurrent-4` 10088 ns/op →
+  4770 ns/op (−53%); `BenchmarkPutConcurrentLarge-4` (4 KB payload) 7499 →
+  8725 ns/op as the clone+marshal now overlaps with other Puts. New
+  concurrent benchmarks (`BenchmarkPutConcurrent`,
+  `BenchmarkPutConcurrentLarge`) lock the gain in. Full suite green under
+  `-race`.
+
 ## [0.10.4] — 2026-11-15
 
 ### Changed
