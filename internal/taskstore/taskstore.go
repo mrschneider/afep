@@ -297,12 +297,13 @@ func (s *Store) Put(env *afepv1.TaskEnvelope) error {
 	if env == nil || env.GetTaskId() == "" {
 		return fmt.Errorf("afep/taskstore: envelope needs a task id")
 	}
-	s.mu.Lock()
 	id := env.GetTaskId()
-	if _, exists := s.tasks[id]; !exists && s.maxTasks > 0 && len(s.tasks) >= s.maxTasks {
-		s.mu.Unlock()
-		return fmt.Errorf("afep/taskstore: task limit %d reached", s.maxTasks)
-	}
+	// The clone and the marshal are the expensive part of Put (O(envelope
+	// size)) and are pure functions of `env` — they read no store state.
+	// Running them OUTSIDE the state lock lets concurrent Puts parallelize
+	// the copy/encode work instead of serializing on the write lock; the
+	// lock is held only for the three O(1) map inserts below.
+	//
 	// Store-owned copy: callers may keep mutating their envelope while
 	// flushes read ours — one clone keeps memory, the raws cache and the
 	// file in lockstep (and kills the Probe/Commit aliasing race).
@@ -311,8 +312,12 @@ func (s *Store) Put(env *afepv1.TaskEnvelope) error {
 	// cached bytes instead of re-encoding.
 	raw, err := proto.Marshal(owned)
 	if err != nil {
-		s.mu.Unlock()
 		return fmt.Errorf("afep/taskstore: marshal %s: %w", id, err)
+	}
+	s.mu.Lock()
+	if _, exists := s.tasks[id]; !exists && s.maxTasks > 0 && len(s.tasks) >= s.maxTasks {
+		s.mu.Unlock()
+		return fmt.Errorf("afep/taskstore: task limit %d reached", s.maxTasks)
 	}
 	s.tasks[id] = owned
 	s.raws[id] = raw
